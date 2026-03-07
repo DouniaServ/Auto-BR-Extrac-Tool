@@ -1221,6 +1221,8 @@ def render_setup_step():
             type=["pdf"],
             key="uploader_batch_record",
             help="Extraction starts automatically after upload.",
+            label_visibility="collapsed",
+
         )
         if uploaded is not None:
             st.session_state.batch_record_bytes = uploaded.read()
@@ -1239,6 +1241,8 @@ def render_setup_step():
             type=["xlsx"],
             key="uploader_review_pack",
             help="Upload the Excel pack previously downloaded from this tool.",
+            label_visibility="collapsed",
+
         )
         if uploaded_xlsx is not None:
             try:
@@ -1656,3 +1660,4 @@ elif st.session_state.view_step == "Export Excel":
 
 
 st.markdown(f"<div class='footer-version'>Tool version: {TOOL_VERSION}</div>", unsafe_allow_html=True)
+
