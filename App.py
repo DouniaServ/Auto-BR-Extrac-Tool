@@ -1217,7 +1217,7 @@ def render_setup_step():
             unsafe_allow_html=True,
         )
         uploaded = st.file_uploader(
-            label="",
+            label="Upload Batch Record (PDF)",
             type=["pdf"],
             key="uploader_batch_record",
             help="Extraction starts automatically after upload.",
@@ -1235,7 +1235,7 @@ def render_setup_step():
     with tab_resume:
         st.markdown("#### Upload Review Pack (Excel) to resume review (even next day)")
         uploaded_xlsx = st.file_uploader(
-            label="",
+            label="Upload Review Pack (Excel)",
             type=["xlsx"],
             key="uploader_review_pack",
             help="Upload the Excel pack previously downloaded from this tool.",
@@ -1653,5 +1653,6 @@ elif st.session_state.view_step == "Review":
     render_review_step()
 elif st.session_state.view_step == "Export Excel":
     render_export_step()
+
 
 st.markdown(f"<div class='footer-version'>Tool version: {TOOL_VERSION}</div>", unsafe_allow_html=True)
