@@ -7,6 +7,7 @@ import time
 import uuid
 import hashlib
 import traceback
+import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Any
 
@@ -639,6 +640,28 @@ def validate_df(df: pd.DataFrame, schema: Dict[str, Any]) -> ValidationResult:
 
 
 # =============================================================================
+# Excel-safe text cleaning
+# =============================================================================
+ILLEGAL_CHARACTERS_RE = re.compile(r'[\x00-\x08\x0B-\x0C\x0E-\x1F]')
+
+
+def clean_excel_value(value):
+    if isinstance(value, str):
+        value = value.replace("\ufeff", "")
+        value = ILLEGAL_CHARACTERS_RE.sub("", value)
+    return value
+
+
+def clean_df_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    try:
+        return df.map(clean_excel_value)
+    except Exception:
+        return df.applymap(clean_excel_value)
+
+
+# =============================================================================
 # Excel helpers
 # =============================================================================
 def make_review_sheet_df() -> pd.DataFrame:
@@ -679,11 +702,15 @@ def df_to_excel_bytes(df: pd.DataFrame, include_audit: bool = True) -> bytes:
     propagate_reviewer_to_df(fill_all_rows=False)
 
     out = io.BytesIO()
+    safe_df = clean_df_for_excel(df)
+    safe_review_df = clean_df_for_excel(make_review_sheet_df())
+    safe_audit_df = clean_df_for_excel(pd.DataFrame(st.session_state.audit_log))
+
     with pd.ExcelWriter(out, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name="Extracted")
-        make_review_sheet_df().to_excel(w, index=False, sheet_name="Review")
+        safe_df.to_excel(w, index=False, sheet_name="Extracted")
+        safe_review_df.to_excel(w, index=False, sheet_name="Review")
         if include_audit:
-            pd.DataFrame(st.session_state.audit_log).to_excel(w, index=False, sheet_name="Audit log")
+            safe_audit_df.to_excel(w, index=False, sheet_name="Audit log")
     return out.getvalue()
 
 
@@ -1585,12 +1612,16 @@ def _build_excel_bytes_cached(df_csv: str, include_audit: bool, audit_csv: str, 
     review_df = pd.read_csv(io.StringIO(review_csv)) if review_csv else pd.DataFrame()
     audit_df = pd.read_csv(io.StringIO(audit_csv)) if audit_csv else pd.DataFrame()
 
+    safe_df = clean_df_for_excel(df)
+    safe_review_df = clean_df_for_excel(review_df)
+    safe_audit_df = clean_df_for_excel(audit_df)
+
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name="Extracted")
-        review_df.to_excel(w, index=False, sheet_name="Review")
+        safe_df.to_excel(w, index=False, sheet_name="Extracted")
+        safe_review_df.to_excel(w, index=False, sheet_name="Review")
         if include_audit:
-            audit_df.to_excel(w, index=False, sheet_name="Audit log")
+            safe_audit_df.to_excel(w, index=False, sheet_name="Audit log")
     return out.getvalue()
 
 
