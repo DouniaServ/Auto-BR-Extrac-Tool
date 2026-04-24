@@ -699,7 +699,7 @@ def make_review_sheet_df() -> pd.DataFrame:
 
 
 def df_to_excel_bytes(df: pd.DataFrame, include_audit: bool = True) -> bytes:
-    propagate_reviewer_to_df(fill_all_rows=False)
+    propagate_reviewer_to_df(fill_all_rows=True)
 
     out = io.BytesIO()
     safe_df = clean_df_for_excel(df)
@@ -1322,7 +1322,7 @@ def render_review_metadata_panel():
 
     if new_reviewer != st.session_state.reviewer_name:
         st.session_state.reviewer_name = new_reviewer
-        propagate_reviewer_to_df(fill_all_rows=False)
+        propagate_reviewer_to_df(fill_all_rows=True)
         mark_dirty("reviewer_name_changed")
         audit("reviewer_name_changed", f"reviewer={new_reviewer}")
 
@@ -1377,7 +1377,7 @@ def render_review_metadata_panel():
                 st.error(f"Approval blocked: {not_reviewed} rows are not reviewed yet.")
                 return
 
-            propagate_reviewer_to_df(fill_all_rows=False)
+            propagate_reviewer_to_df(fill_all_rows=True)
 
             st.session_state.review_status = "Approved"
             st.session_state.reviewed_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1400,23 +1400,34 @@ def render_review_metadata_panel():
 def render_review_pack_panel():
     st.subheader("Offline review (recommended for 1000+ rows)")
 
-    cols = st.session_state.active_columns or (list(st.session_state.df.columns) if st.session_state.df is not None else [])
+    cols = st.session_state.active_columns or (
+        list(st.session_state.df.columns) if st.session_state.df is not None else []
+    )
 
     c1, c2 = st.columns([1.2, 1.0])
+
     with c1:
         if st.session_state.df is not None:
-            pack_bytes = df_to_excel_bytes(st.session_state.df, include_audit=True)
-            pack_name = f"{st.session_state.site}_review_pack_{time.strftime('%Y%m%d_%H%M')}.xlsx"
-            st.download_button(
-                label="📤 Download review pack (Excel)",
-                data=pack_bytes,
-                file_name=pack_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+            if not st.session_state.reviewer_name.strip():
+                st.warning("Please enter your name first.")
+            else:
+                pack_bytes = df_to_excel_bytes(st.session_state.df, include_audit=True)
+                pack_name = f"{st.session_state.site}_review_pack_{time.strftime('%Y%m%d_%H%M')}.xlsx"
+
+                st.download_button(
+                    label="📤 Download review pack (Excel)",
+                    data=pack_bytes,
+                    file_name=pack_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
 
     with c2:
-        uploaded_xlsx = st.file_uploader("📥 Upload reviewed Excel (review pack)", type=["xlsx"], key="upload_review_pack_inside_review")
+        uploaded_xlsx = st.file_uploader(
+            "📥 Upload reviewed Excel (review pack)",
+            type=["xlsx"],
+            key="upload_review_pack_inside_review"
+        )
 
     if uploaded_xlsx is not None:
         try:
@@ -1650,7 +1661,7 @@ def render_export_step():
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    propagate_reviewer_to_df(fill_all_rows=False)
+    propagate_reviewer_to_df(fill_all_rows=True)
 
     df_csv = st.session_state.df.to_csv(index=False)
     review_df = make_review_sheet_df()
