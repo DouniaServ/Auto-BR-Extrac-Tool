@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 import os
 import re
 import tempfile
@@ -20,7 +18,7 @@ def strip_accents_lower(s: str) -> str:
     s = (s or "").lower().strip()
     return (s.replace("é", "e").replace("è", "e").replace("ê", "e")
             .replace("à", "a").replace("ù", "u").replace("î", "i")
-            .replace("’", "'").replace("‘", "'"))
+            .replace("'", "'").replace("'", "'"))
 
 def normalize_for_repetition(s: str) -> str:
     t = strip_accents_lower(norm(s))
@@ -30,6 +28,234 @@ def normalize_for_repetition(s: str) -> str:
     t = re.sub(r"\d{4}-\d{2}-\d{2}", "date#", t)
     t = re.sub(r"\b\d{1,2}:\d{2}\b", "time#", t)
     return t
+
+
+# =============================================================================
+# SURGICAL FIX: Keep Pulvérisation instructions as separate complete rows
+# =============================================================================
+
+PULVERISATION_HEADER_RX = re.compile(
+    r"""(?ix)
+    (?:-?\s*consignes\s*:\s*)?
+    (?P<rank>1\s*(?:ère|ere|re)|2\s*(?:nde|ème|eme)|3\s*(?:ème|eme))
+    \s+pulv[ée]risation\s*:
+    """
+)
+
+PULVERISATION_SUBITEM_RX = re.compile(
+    r"""(?ix)^\s*(?:-\s*)?(?:
+        d[ée]b(?:it|ut)\s*(?:→|->|:|=)?
+        |vitesse\s+turbine\s*(?:→|->|:|=)?
+        |quantit[ée]\s+pulv[ée]ris[ée]e\s*(?:→|->|:|=)?
+    )"""
+)
+
+PULVERISATION_VALUE_RX = re.compile(
+    r"""(?ix)
+    \d+(?:[.,]\d+)?\s*
+    (?:
+        g\s*/\s*min
+        |tr\s*/\s*min
+        |kg
+    )
+    """
+)
+
+
+def _normalize_pulverisation_arrows(text: str) -> str:
+    """Normalize extraction variants while preserving business wording."""
+    t = norm(text)
+    t = re.sub(r"\s*(?:->|=>|→)\s*", " → ", t)
+    t = re.sub(r"(?i)\bPulverisation\b", "Pulvérisation", t)
+    t = re.sub(r"(?i)\bd[ée]but\b\s*(?:→|:|=)?", "Débit →", t)
+    t = re.sub(r"(?i)\bd[ée]bit\b\s*(?:→|:|=)?", "Débit →", t)
+    t = re.sub(r"(?i)\bvitesse\s+turbine\b\s*(?:→|:|=)?", "Vitesse turbine →", t)
+    t = re.sub(r"(?i)\bquantit[ée]\s+pulv[ée]ris[ée]e\b\s*(?:→|:|=)?", "Quantité pulvérisée →", t)
+    t = re.sub(r"(?i)Pulvérisation\s*:", "Pulvérisation :", t)
+    t = re.sub(r"\s+([:])", r"\1", t)
+    return norm(t)
+
+
+def _extract_pulverisation_values(chunk: str) -> Tuple[str, str, str]:
+    """Extract Débit, Vitesse turbine, Quantité pulvérisée from a noisy chunk."""
+    values = [norm(v) for v in PULVERISATION_VALUE_RX.findall(chunk)]
+
+    debit = ""
+    vitesse = ""
+    quantite = ""
+
+    for value in values:
+        if not debit and re.search(r"(?i)g\s*/\s*min", value):
+            debit = value
+            continue
+        if not vitesse and re.search(r"(?i)tr\s*/\s*min", value):
+            vitesse = value
+            continue
+        if not quantite and re.search(r"(?i)\bkg\b", value):
+            quantite = value
+            continue
+
+    return debit, vitesse, quantite
+
+
+def _split_pulverisation_block(text: str) -> List[str]:
+    """
+    Auto-detect Pulvérisation sections and distribute detected values in order:
+      g/min  -> Débit
+      tr/min -> Vitesse turbine
+      kg     -> Quantité pulvérisée
+
+    Handles cases where the PDF extraction places 3ème values before the 3ème header.
+    """
+    block = _normalize_pulverisation_arrows(text)
+    block = re.sub(r"(?i)\bPulverisation\b", "Pulvérisation", block)
+    block = re.sub(r"(?i)\s+", " ", block).strip()
+
+    header_rx = re.compile(
+        r"(?i)(?:-?\s*Consignes\s*:\s*)?"
+        r"(1\s*(?:ère|ere|re)|2\s*(?:nde|eme|ème)|3\s*(?:eme|ème))"
+        r"\s+Pulvérisation\s*:"
+    )
+
+    headers = [norm(m.group(1)) for m in header_rx.finditer(block)]
+    if not headers:
+        return []
+
+    values = re.findall(
+        r"\d+(?:[.,]\d+)?\s*(?:g\s*/\s*min|tr\s*/\s*min|kg)",
+        block,
+        flags=re.I,
+    )
+    values = [norm(v) for v in values]
+
+    rows = []
+    value_idx = 0
+
+    for rank in headers:
+        debit = ""
+        vitesse = ""
+        quantite = ""
+
+        # Débit = next g/min
+        while value_idx < len(values):
+            v = values[value_idx]
+            value_idx += 1
+            if re.search(r"g\s*/\s*min", v, re.I):
+                debit = v
+                break
+
+        # Vitesse turbine = next tr/min
+        while value_idx < len(values):
+            v = values[value_idx]
+            value_idx += 1
+            if re.search(r"tr\s*/\s*min", v, re.I):
+                vitesse = v
+                break
+
+        # Quantité pulvérisée = next kg, optional
+        if value_idx < len(values) and re.search(r"\bkg\b", values[value_idx], re.I):
+            quantite = values[value_idx]
+            value_idx += 1
+
+        parts = [
+            f"- Consignes : {rank} Pulvérisation :",
+            f"Débit → {debit}" if debit else "Débit →",
+            f"Vitesse turbine → {vitesse}" if vitesse else "Vitesse turbine →",
+        ]
+
+        if quantite:
+            parts.append(f"Quantité pulvérisée → {quantite}")
+
+        rows.append(norm(" ".join(parts)))
+
+    return rows
+
+def _looks_like_pulverisation_context(title: str) -> bool:
+    low = strip_accents_lower(title)
+    return (
+        "consignes" in low
+        or "pulverisation" in low
+        or bool(PULVERISATION_HEADER_RX.search(title))
+        or bool(PULVERISATION_SUBITEM_RX.match(title))
+        or bool(PULVERISATION_VALUE_RX.fullmatch(norm(title)))
+    )
+
+
+def consolidate_instruction_blocks(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert fragmented Pulvérisation instruction blocks into separate complete rows.
+
+    Handles cases where the PDF extraction produces lines such as:
+      - Consignes : 1ère Pulvérisation : Débit →
+      1000 g / min
+      Vitesse turbine →
+      5 tr / min 10 kg
+    """
+    if df.empty or "Data Title" not in df.columns:
+        return df
+
+    records = df.to_dict("records")
+    fixed_records: List[Dict] = []
+    i = 0
+
+    while i < len(records):
+        row = dict(records[i])
+        title = norm(row.get("Data Title", ""))
+
+        # Start collecting only at a true Consignes/Pulvérisation header.
+        starts_pulv_block = (
+            "consignes" in strip_accents_lower(title)
+            or bool(PULVERISATION_HEADER_RX.search(title))
+        )
+
+        if not starts_pulv_block:
+            fixed_records.append(row)
+            i += 1
+            continue
+
+        block_parts = [title]
+        j = i + 1
+
+        while j < len(records):
+            next_title = norm(records[j].get("Data Title", ""))
+            if not next_title:
+                j += 1
+                continue
+
+            next_low = strip_accents_lower(next_title)
+            next_is_pulv_related = (
+                "consignes" in next_low
+                or bool(PULVERISATION_HEADER_RX.search(next_title))
+                or bool(PULVERISATION_SUBITEM_RX.match(next_title))
+                or bool(PULVERISATION_VALUE_RX.search(next_title))
+            )
+
+            if next_is_pulv_related:
+                block_parts.append(next_title)
+                j += 1
+                continue
+
+            break
+
+        block_text = norm(" ".join(block_parts))
+        split_rows = _split_pulverisation_block(block_text)
+
+        if split_rows:
+            for split_title in split_rows:
+                new_row = dict(row)
+                new_row["Data Title"] = split_title
+                new_row["Data tag"] = "instruction"
+                fixed_records.append(new_row)
+            i = j
+            continue
+
+        fixed_records.append(row)
+        i += 1
+
+    out = pd.DataFrame(fixed_records)
+    if "Data number" in out.columns:
+        out["Data number"] = range(1, len(out) + 1)
+    return out
 
 
 # =============================================================================
@@ -70,10 +296,10 @@ def should_skip_text(text: str) -> bool:
 
 
 # =============================================================================
-# CONFORMITE DE L’EDITION
+# CONFORMITE DE L'EDITION
 # =============================================================================
 
-CONFORMITE_EDITION_LABEL = "CONFORMITE DE L’EDITION"
+CONFORMITE_EDITION_LABEL = "CONFORMITE DE L'EDITION"
 
 def split_conformite_on_date_visa(text: str) -> Optional[List[str]]:
     s = norm(text)
@@ -494,8 +720,8 @@ def merge_wrapped_titles(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
 def merge_bullets_under_resources(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """
     Merge:
-      ' Ressources utilisées :' (or 'Ressources utilisées :')
-      followed by bullet rows ('- xxx', '• xxx', ' xxx', ...)
+      ' Ressources utilisées :' (or 'Ressources utilisées :')
+      followed by bullet rows ('- xxx', '• xxx', ' xxx', ...)
     into ONE row.
     """
     out: List[Dict[str, str]] = []
@@ -835,13 +1061,402 @@ def enrich_keep_values(r: Dict[str, str], theo_col: str = "Théorique value", vi
 
 
 # =============================================================================
-# Extraction engine (UNCHANGED LOGIC) + UI-friendly wrappers
+# Gidy-specific output cleanup
+# =============================================================================
+
+GIDY_VALUE_COLS = ["Théorique", "Réel", "Visa", "N° observ."]
+GIDY_HELPER_COLS = ["Théorique value", "Visa value"]
+GIDY_DROP_COLS = GIDY_VALUE_COLS + GIDY_HELPER_COLS
+
+EMPTY_LIKE_VALUES = {"", "nan", "none", "null", "<na>", "na", "n/a"}
+PLACEHOLDER_LINE_RX = re.compile(r"^\s*[_\-–—]{6,}(?:\s+de)?\s*$", re.IGNORECASE)
+PAREN_FRAGMENT_RX = re.compile(r"^\s*\([^)]{1,30}\)\s*$")
+DANGLING_TITLE_RX = re.compile(r"(?i)(?:\b(de|du|des|d'|la|le|les|en|à|a|au|aux|pour|avec|sans|par|sur|et|ou)\b|[-/:=])\s*$")
+LOWER_CONTINUATION_RX = re.compile(r"^\s*(de|du|des|d'|en|et|ou|compression|calibrage|arrêts?|bien|stoppé)\b", re.IGNORECASE)
+
+
+def is_empty_like(value) -> bool:
+    if value is None or pd.isna(value):
+        return True
+    return norm(str(value)).lower() in EMPTY_LIKE_VALUES
+
+
+def normalize_value_for_compare(value: str) -> str:
+    s = strip_accents_lower(norm(value))
+    s = re.sub(r"\s+", "", s)
+    s = s.replace("°c", "°c")
+    return s
+
+
+def title_already_contains_value(title: str, value: str) -> bool:
+    title_key = normalize_value_for_compare(title)
+    value_key = normalize_value_for_compare(value)
+    if not value_key:
+        return True
+    return f"({value_key})" in title_key or value_key in title_key
+
+
+def append_value_to_title(title: str, value: str) -> str:
+    title = norm(title)
+    value = norm(value)
+    if not value:
+        return title
+    if title_already_contains_value(title, value):
+        return title
+    return norm(f"{title} ({value})") if title else f"({value})"
+
+
+def row_has_value(row: Dict[str, str]) -> bool:
+    return any(not is_empty_like(row.get(c, "")) for c in GIDY_VALUE_COLS)
+
+
+def merge_values(prev: Dict[str, str], cur: Dict[str, str]) -> None:
+    for c in GIDY_VALUE_COLS:
+        cur_val = norm(cur.get(c, ""))
+        if not cur_val:
+            continue
+        prev_val = norm(prev.get(c, ""))
+        if not prev_val:
+            prev[c] = cur_val
+        elif normalize_value_for_compare(cur_val) not in normalize_value_for_compare(prev_val):
+            prev[c] = norm(f"{prev_val}; {cur_val}")
+
+
+def should_merge_with_previous(prev: Dict[str, str], cur: Dict[str, str]) -> bool:
+    prev_title = norm(prev.get("Data Title", ""))
+    cur_title = norm(cur.get("Data Title", ""))
+
+    if not prev_title or not cur_title:
+        return False
+
+    if PLACEHOLDER_LINE_RX.match(cur_title):
+        return False
+
+    if PAREN_FRAGMENT_RX.match(cur_title):
+        return True
+
+    if DANGLING_TITLE_RX.search(prev_title):
+        return True
+
+    if LOWER_CONTINUATION_RX.match(cur_title) and not is_numbered_header(cur_title):
+        return True
+
+    prev_terminal = bool(TERMINAL_PUNCT_RX.search(prev_title))
+    if not prev_terminal and _starts_continuation(cur_title):
+        return True
+
+    return False
+
+
+def cleanup_gidy_fragment_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "Data Title" not in df.columns:
+        return df.copy()
+
+    records = df.to_dict("records")
+    cleaned: List[Dict[str, str]] = []
+
+    for row in records:
+        row = dict(row)
+        title = norm(row.get("Data Title", ""))
+
+        if not title:
+            continue
+
+        if PLACEHOLDER_LINE_RX.match(title):
+            continue
+
+        if cleaned and should_merge_with_previous(cleaned[-1], row):
+            prev = cleaned[-1]
+            cur_title = norm(row.get("Data Title", ""))
+
+            if PAREN_FRAGMENT_RX.match(cur_title):
+                prev["Data Title"] = norm(f"{prev.get('Data Title', '')} {cur_title}")
+            else:
+                prev["Data Title"] = norm(f"{prev.get('Data Title', '')} {cur_title}")
+
+            merge_values(prev, row)
+
+            if norm(row.get("Visa", "")):
+                prev["Data tag"] = "visa"
+            elif norm(row.get("Théorique", "")) and prev.get("Data tag") == "instruction":
+                prev["Data tag"] = "théorique"
+            continue
+        cleaned.append(row)
+
+    out = pd.DataFrame(cleaned)
+    if "Data number" in out.columns:
+        out["Data number"] = range(1, len(out) + 1)
+    return out
+
+
+
+# =============================================================================
+# Final Gidy cleanup: remove PDF/image artifacts and orphan fragments
+# =============================================================================
+
+IMAGE_PLACEHOLDER_RX = re.compile(r"(?i)<image:\s*[^>]+>")
+BAD_HEADER_PREFIX_RX = re.compile(r"^\s*(\d+)\s*[''`´]\s*[_\-–—]\s*")
+NUMERIC_OR_UNITISH_ROW_RX = re.compile(
+    r"""(?ix)
+    ^\s*
+    (?:
+        \d+(?:[.,]\d+)?\s*(?:\([^)]{1,20}\)|kg|g|mg|mbar|bar|°\s*c|°c|c|min|h|tr/min|rpm|%)
+        |
+        \d+(?:[.,]\d+)?
+        |
+        kg|g|mg|mbar|bar|°\s*c|°c|c|min|h|tr/min|rpm|%
+    )
+    \s*$
+    """
+)
+ORPHAN_FRAGMENT_ROW_RX = re.compile(
+    r"""(?ix)
+    ^\s*
+    (?:
+        /\s*visa
+        | \(?\s*si\s*\)?
+        | fraction
+        | c\s*/\s*nc
+        | o\s*/\s*n
+        | n\s*/\s*a
+        | de\s+cps\s*/\s*h
+        | cps\s*/\s*h
+    )
+    \s*:?\s*$
+    """
+)
+BULLET_CHAR_RX = re.compile(r"^[\uf0b7•‣▪●・\u2022\u25AA\u25CF]\s*")
+
+ARROW_LABEL_END_RX = re.compile(r"(?i)(?:→|->|:|=)\s*$")
+THEORIQUE_VALUE_ROW_RX = re.compile(
+    r"""(?ix)
+    ^\s*
+    [<>≤≥]?\s*\d+(?:[.,]\d+)?
+    (?:\s*(?:±|\+/-)\s*\d+(?:[.,]\d+)?)?
+    \s*(?:\([^)]{1,25}\)|kg|g|mg|mbar|bar|°\s*c|°c|c|min|h|tr/min|rpm|%)?
+    \s*$
+    """
+)
+RESOURCE_CONTINUATION_RX = re.compile(r"^\s*(?:/|,|;|et\b|ou\b|box\b|balance\b|balances\b|sonde\b|pointe\b|mgs\b)", re.IGNORECASE)
+RESOURCE_TITLE_RX = re.compile(r"(?i)\bressources?\s+utilis[ée]es?\b")
+HEADER_FRAGMENT_TITLE_RX = re.compile(
+    r"""(?ix)
+    ^\s*(?:
+        masse|quantit[ée]|fraction|op[ée]ration|statut|commentaire|date|signature|visa|nom|pr[ée]nom
+    )\s*$
+    """
+)
+REPEATED_CHUNK_RX = re.compile(r"(?i)\b(.{4,60}?)(?:\s*[:;-]?\s+\1\b){1,}")
+
+
+def collapse_repeated_gidy_chunks(text: str) -> str:
+    """Collapse simple repeated chunks created by PDF block extraction."""
+    t = norm(text)
+    if not t:
+        return ""
+
+    words = t.split()
+    if len(words) >= 4 and len(words) % 2 == 0:
+        half = len(words) // 2
+        if [w.lower() for w in words[:half]] == [w.lower() for w in words[half:]]:
+            t = " ".join(words[:half])
+
+    previous = None
+    while previous != t:
+        previous = t
+        t = REPEATED_CHUNK_RX.sub(lambda m: norm(m.group(1)), t)
+    return norm(t)
+
+
+def is_resource_context(title: str) -> bool:
+    return bool(RESOURCE_TITLE_RX.search(strip_accents_lower(title))) or is_resources_title(title)
+
+
+def should_merge_final_gidy_row(prev_title: str, title: str, same_page: bool) -> bool:
+    """Final conservative row merge rules for Gidy after all basic cleanup."""
+    if not same_page or not prev_title or not title:
+        return False
+    if is_numbered_header(title):
+        return False
+    if is_resource_context(prev_title) and RESOURCE_CONTINUATION_RX.match(title):
+        return True
+    if ARROW_LABEL_END_RX.search(prev_title) and THEORIQUE_VALUE_ROW_RX.match(title):
+        return True
+    if DANGLING_TITLE_RX.search(prev_title) and THEORIQUE_VALUE_ROW_RX.match(title):
+        return True
+    if title.startswith("/") and len(title) <= 140:
+        return True
+    return False
+
+
+def join_final_gidy_titles(prev_title: str, title: str) -> str:
+    """Join two title fragments with stable spacing and punctuation."""
+    prev_title = norm(prev_title)
+    title = norm(title)
+    if not prev_title:
+        return title
+    if not title:
+        return prev_title
+    if normalize_value_for_compare(title) in normalize_value_for_compare(prev_title):
+        return prev_title
+    return norm(f"{prev_title} {title}")
+
+
+def normalize_gidy_title_text(title: str) -> str:
+    """Normalize visible title text without changing business content."""
+    t = norm(title)
+    if not t:
+        return ""
+
+    # Remove PyMuPDF image placeholders; keep surrounding useful text if any.
+    t = IMAGE_PLACEHOLDER_RX.sub("", t)
+    t = norm(t)
+
+    # Fix artifacts like "3'_ ENCHAINEMENT" -> "3 - ENCHAINEMENT".
+    t = BAD_HEADER_PREFIX_RX.sub(r"\1 - ", t)
+
+    # Normalize a few recurring PDF extraction artifacts.
+    t = t.replace("CONFORMITE DE L'ETAPE", "CONFORMITE DE L'ETAPE")
+    t = t.replace("CONFORMITE DE L'EDITION", "CONFORMITE DE L'EDITION")
+    t = re.sub(r"\s+:", " :", t)
+    t = re.sub(r":\s*:", ":", t)
+    t = norm(t)
+
+    # Collapse repeated short chunks such as "C / NC Visa : C / NC Visa : ..."
+    for phrase in ("C / NC Visa :", "C / NC Visa", "C / NC", "O / N", "Visa :"):
+        pattern = re.compile(rf"(?i)(?:{re.escape(phrase)}\s*){{2,}}")
+        t = pattern.sub(phrase, t)
+
+    t = collapse_repeated_gidy_chunks(t)
+    return norm(t)
+
+
+def should_drop_final_gidy_row(title: str) -> bool:
+    """Rows that are pure extraction noise after all merge attempts."""
+    t = norm(title)
+    if not t:
+        return True
+
+    if IMAGE_PLACEHOLDER_RX.fullmatch(t):
+        return True
+
+    if PLACEHOLDER_LINE_RX.match(t):
+        return True
+
+    if ORPHAN_FRAGMENT_ROW_RX.match(t):
+        return True
+
+    if HEADER_FRAGMENT_TITLE_RX.match(t):
+        return True
+
+    # Single orphan parenthesis/unit fragments are not reviewable data titles.
+    if PAREN_FRAGMENT_RX.match(t) and len(t) <= 12:
+        return True
+
+    return False
+
+
+def final_cleanup_gidy_output(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Final cleanup after Théorique has been merged into Data Title:
+      - remove image placeholder rows
+      - normalize obvious PDF artifacts
+      - merge numeric/unit-only orphan rows into previous row when useful
+      - drop remaining orphan fragments
+      - renumber Data number
+    """
+    if df.empty or "Data Title" not in df.columns:
+        return df.copy()
+
+    records = df.to_dict("records")
+    cleaned: List[Dict[str, str]] = []
+
+    for row in records:
+        row = dict(row)
+        title = normalize_gidy_title_text(row.get("Data Title", ""))
+        row["Data Title"] = title
+
+        if should_drop_final_gidy_row(title):
+            continue
+
+        if cleaned:
+            prev = cleaned[-1]
+            prev_title = norm(prev.get("Data Title", ""))
+
+            same_page = str(prev.get("Page number", "")) == str(row.get("Page number", ""))
+
+            # Example: previous "- Entrefer", current "1 (mm)" -> "- Entrefer 1 (mm)"
+            # Example: previous already contains "537,9", current "537,9" -> drop duplicate
+            if same_page and NUMERIC_OR_UNITISH_ROW_RX.match(title):
+                if title_already_contains_value(prev_title, title):
+                    continue
+                if not TERMINAL_PUNCT_RX.search(prev_title):
+                    prev["Data Title"] = norm(f"{prev_title} {title}")
+                    if prev.get("Data tag") == "instruction" and row.get("Data tag") == "théorique":
+                        prev["Data tag"] = "théorique"
+                    continue
+
+            # Merge tiny parenthetical fragments missed earlier.
+            if same_page and PAREN_FRAGMENT_RX.match(title) and len(title) <= 20:
+                if not title_already_contains_value(prev_title, title.strip("()")):
+                    prev["Data Title"] = norm(f"{prev_title} {title}")
+                continue
+
+            # Smarter final merges: resources continuation and instruction -> theoretical value.
+            if should_merge_final_gidy_row(prev_title, title, same_page):
+                prev["Data Title"] = join_final_gidy_titles(prev_title, title)
+                if prev.get("Data tag") == "instruction" and row.get("Data tag") == "théorique":
+                    prev["Data tag"] = "théorique"
+                continue
+
+        cleaned.append(row)
+
+    out = pd.DataFrame(cleaned)
+
+    if "Data number" in out.columns:
+        out["Data number"] = range(1, len(out) + 1)
+
+    return out
+
+
+def transform_gidy_output(df: pd.DataFrame, compact_output: bool = True) -> pd.DataFrame:
+    df = df.copy()
+
+    for col in ["Data Title"] + GIDY_VALUE_COLS:
+        if col not in df.columns:
+            df[col] = ""
+
+    df = cleanup_gidy_fragment_rows(df)
+
+    if "Data Title" in df.columns and "Théorique" in df.columns:
+        df["Data Title"] = [
+            append_value_to_title(title, theo)
+            for title, theo in zip(df["Data Title"], df["Théorique"])
+        ]
+
+    drop_cols = [c for c in GIDY_DROP_COLS if c in df.columns]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+
+    df = final_cleanup_gidy_output(df)
+
+    if compact_output:
+        for col in UI_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        df = df[UI_COLUMNS].copy()
+
+    return df
+
+
+# =============================================================================
+# Extraction engine
 # =============================================================================
 
 def pdf_to_dataframe(pdf_path: str, compact_output: bool = True) -> pd.DataFrame:
     """
     Same extraction logic as pdf_to_excel, but returns the DataFrame (for UI usage).
-    Ensures raw columns exist for downstream validation.
+    Ensures raw columns exist for downstream processing.
     """
     pdf_name = os.path.basename(pdf_path)
 
@@ -866,7 +1481,6 @@ def pdf_to_dataframe(pdf_path: str, compact_output: bool = True) -> pd.DataFrame
             if stage:
                 current_process = stage
 
-            # Page 1 => 0, Page 2+ => 1 (constant per page)
             para_no = 0 if pi == 0 else 1
 
             words = get_words(page, header_margin=60, footer_margin=60)
@@ -980,7 +1594,7 @@ def pdf_to_dataframe(pdf_path: str, compact_output: bool = True) -> pd.DataFrame
     recs = [enrich_keep_values(r, theo_col="Théorique value", visa_col="Visa value") for r in recs]
     df = pd.DataFrame(recs)
 
-    # Ensure App.py-required raw columns exist (even if you later subset)
+    # Ensure raw columns exist before Gidy transform
     required_raw = ["Théorique", "Réel", "Visa", "N° observ."]
     for c in required_raw:
         if c not in df.columns:
@@ -994,21 +1608,12 @@ def pdf_to_dataframe(pdf_path: str, compact_output: bool = True) -> pd.DataFrame
         mask = df["Visa"].fillna("").eq("")
         df.loc[mask, "Visa"] = df.loc[mask, "Visa value"].fillna("")
 
-    if compact_output:
-        keep_cols = [
-            "PDF name",
-            "Data number", "Page number", "Paragraph number",
-            "Process step", "Sub process step",
-            "Data Title", "Data tag",
-            "Théorique value",
-        ]
-        if KEEP_VISA_VALUE:
-            keep_cols.append("Visa value")
+    df = transform_gidy_output(df, compact_output=compact_output)
 
-        # Keep raw cols too so validation passes
-        keep_cols += required_raw
-
-        df = df[[c for c in keep_cols if c in df.columns]]
+    # =========================================================================
+    # SURGICAL FIX: Consolidate fragmented instruction blocks
+    # =========================================================================
+    df = consolidate_instruction_blocks(df)
 
     return df
 
@@ -1016,6 +1621,7 @@ def pdf_to_dataframe(pdf_path: str, compact_output: bool = True) -> pd.DataFrame
 def pdf_to_excel(pdf_path: str, xlsx_path: str, compact_output: bool = True) -> None:
     """
     Backward compatible: same behavior as before, but uses pdf_to_dataframe internally.
+    Now includes the SURGICAL FIX for split rows.
     """
     df = pdf_to_dataframe(pdf_path, compact_output=compact_output)
     df.to_excel(xlsx_path, index=False)
@@ -1034,13 +1640,6 @@ UI_COLUMNS = [
     "Sub process step",
     "Data Title",
     "Data tag",
-    "Théorique value",
-    "Visa value",
-    # keep raw cols for App.py validation
-    "Théorique",
-    "Réel",
-    "Visa",
-    "N° observ.",
 ]
 
 def extract(file_bytes: bytes, file_name: str, product_name: Optional[str] = None) -> pd.DataFrame:
@@ -1061,7 +1660,7 @@ def extract(file_bytes: bytes, file_name: str, product_name: Optional[str] = Non
             if col not in df.columns:
                 df[col] = ""
 
-        # ✅ FIX PDF name column:
+        # Fix PDF name column:
         # 1) clear it for all rows
         df["PDF name"] = ""
         # 2) set only the first row to the real uploaded filename
@@ -1069,6 +1668,7 @@ def extract(file_bytes: bytes, file_name: str, product_name: Optional[str] = Non
             df.loc[df.index[0], "PDF name"] = file_name
 
         return df[UI_COLUMNS].copy()
+
 
 # =============================================================================
 # Run (optional local testing)
