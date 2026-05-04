@@ -7,7 +7,6 @@ import time
 import uuid
 import hashlib
 import traceback
-import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Any
 
@@ -95,7 +94,6 @@ SITE_SCHEMA: Dict[str, Dict[str, Any]] = {
             "Process step",
             "Sub process step",
             "Data Title",
-            "Value",
             "Data tag",
             REVIEW_OK_COL,
             REVIEWER_COL,
@@ -122,10 +120,6 @@ SITE_SCHEMA: Dict[str, Dict[str, Any]] = {
             "Sub process step",
             "Data Title",
             "Data tag",
-            "Théorique",
-            "Réel",
-            "Visa",
-            "N° observ.",
             REVIEW_OK_COL,
             REVIEWER_COL,
             REVIEWED_AT_COL,
@@ -640,28 +634,6 @@ def validate_df(df: pd.DataFrame, schema: Dict[str, Any]) -> ValidationResult:
 
 
 # =============================================================================
-# Excel-safe text cleaning
-# =============================================================================
-ILLEGAL_CHARACTERS_RE = re.compile(r'[\x00-\x08\x0B-\x0C\x0E-\x1F]')
-
-
-def clean_excel_value(value):
-    if isinstance(value, str):
-        value = value.replace("\ufeff", "")
-        value = ILLEGAL_CHARACTERS_RE.sub("", value)
-    return value
-
-
-def clean_df_for_excel(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    try:
-        return df.map(clean_excel_value)
-    except Exception:
-        return df.applymap(clean_excel_value)
-
-
-# =============================================================================
 # Excel helpers
 # =============================================================================
 def make_review_sheet_df() -> pd.DataFrame:
@@ -699,18 +671,16 @@ def make_review_sheet_df() -> pd.DataFrame:
 
 
 def df_to_excel_bytes(df: pd.DataFrame, include_audit: bool = True) -> bytes:
-    propagate_reviewer_to_df(fill_all_rows=True)
+    propagate_reviewer_to_df(fill_all_rows=False)
+
+    export_df = review_ok_to_excel_symbols(df)
 
     out = io.BytesIO()
-    safe_df = clean_df_for_excel(df)
-    safe_review_df = clean_df_for_excel(make_review_sheet_df())
-    safe_audit_df = clean_df_for_excel(pd.DataFrame(st.session_state.audit_log))
-
     with pd.ExcelWriter(out, engine="openpyxl") as w:
-        safe_df.to_excel(w, index=False, sheet_name="Extracted")
-        safe_review_df.to_excel(w, index=False, sheet_name="Review")
+        export_df.to_excel(w, index=False, sheet_name="Extracted")
+        make_review_sheet_df().to_excel(w, index=False, sheet_name="Review")
         if include_audit:
-            safe_audit_df.to_excel(w, index=False, sheet_name="Audit log")
+            pd.DataFrame(st.session_state.audit_log).to_excel(w, index=False, sheet_name="Audit log")
     return out.getvalue()
 
 
@@ -791,6 +761,39 @@ ALIASES_TO_CANONICAL = {
 }
 
 
+
+def coerce_review_ok_series(s: pd.Series) -> pd.Series:
+    """
+    Normalize Review OK values for the app checkbox.
+    Important: bool("☐") is True in Python, so never use astype(bool)
+    directly on this column.
+    """
+    def one(v):
+        if pd.isna(v):
+            return False
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(v)
+        t = str(v).strip().lower()
+        if t in {"", "false", "0", "no", "n", "unchecked", "☐", "□", "none", "nan"}:
+            return False
+        if t in {"true", "1", "yes", "y", "checked", "☑", "☒", "✓", "✔", "x"}:
+            return True
+        # Unknown text should default to False to avoid marking rows reviewed by mistake.
+        return False
+
+    return s.map(one).astype(bool)
+
+
+def review_ok_to_excel_symbols(df: pd.DataFrame) -> pd.DataFrame:
+    """Use symbols only for exported Excel; keep app data boolean."""
+    out = df.copy()
+    if REVIEW_OK_COL in out.columns:
+        ok = coerce_review_ok_series(out[REVIEW_OK_COL])
+        out[REVIEW_OK_COL] = ok.map(lambda x: "☑" if x else "☐")
+    return out
+
 def ensure_workflow_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns={c: str(c).strip() for c in df.columns})
     rename_map = {c: ALIASES_TO_CANONICAL[c] for c in df.columns if c in ALIASES_TO_CANONICAL}
@@ -798,7 +801,7 @@ def ensure_workflow_columns(df: pd.DataFrame) -> pd.DataFrame:
         df = df.rename(columns=rename_map)
 
     if "__OLD_PENDING__" in df.columns and REVIEW_OK_COL not in df.columns:
-        old_pending = df["__OLD_PENDING__"].astype(bool)
+        old_pending = coerce_review_ok_series(df["__OLD_PENDING__"])
         df[REVIEW_OK_COL] = (~old_pending)
         df = df.drop(columns=["__OLD_PENDING__"])
 
@@ -806,7 +809,7 @@ def ensure_workflow_columns(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = default
 
-    df[REVIEW_OK_COL] = df[REVIEW_OK_COL].astype(bool)
+    df[REVIEW_OK_COL] = coerce_review_ok_series(df[REVIEW_OK_COL])
     return df
 
 
@@ -1164,7 +1167,7 @@ def propagate_reviewer_to_df(fill_all_rows: bool = False):
         df.loc[target_idx, reviewer_col] = who
 
     if ok_col in df.columns and reviewed_at_col in df.columns:
-        ok_mask = df[ok_col].astype(bool)
+        ok_mask = coerce_review_ok_series(df[ok_col])
         missing_dt = df[reviewed_at_col].isna() | (df[reviewed_at_col].astype(str).str.strip() == "")
         dt_idx = df.index[ok_mask & missing_dt]
         if len(dt_idx) > 0:
@@ -1248,8 +1251,6 @@ def render_setup_step():
             type=["pdf"],
             key="uploader_batch_record",
             help="Extraction starts automatically after upload.",
-            label_visibility="collapsed",
-
         )
         if uploaded is not None:
             st.session_state.batch_record_bytes = uploaded.read()
@@ -1322,7 +1323,7 @@ def render_review_metadata_panel():
 
     if new_reviewer != st.session_state.reviewer_name:
         st.session_state.reviewer_name = new_reviewer
-        propagate_reviewer_to_df(fill_all_rows=True)
+        propagate_reviewer_to_df(fill_all_rows=False)
         mark_dirty("reviewer_name_changed")
         audit("reviewer_name_changed", f"reviewer={new_reviewer}")
 
@@ -1372,12 +1373,12 @@ def render_review_metadata_panel():
             df = st.session_state.df
             schema = st.session_state.active_schema or {}
             ok_col = (schema.get("review_ok_col") or REVIEW_OK_COL).strip()
-            not_reviewed = int((~df[ok_col].astype(bool)).sum()) if (df is not None and ok_col in df.columns) else 0
+            not_reviewed = int((~coerce_review_ok_series(df[ok_col])).sum()) if (df is not None and ok_col in df.columns) else 0
             if not_reviewed > 0:
                 st.error(f"Approval blocked: {not_reviewed} rows are not reviewed yet.")
                 return
 
-            propagate_reviewer_to_df(fill_all_rows=True)
+            propagate_reviewer_to_df(fill_all_rows=False)
 
             st.session_state.review_status = "Approved"
             st.session_state.reviewed_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1400,34 +1401,23 @@ def render_review_metadata_panel():
 def render_review_pack_panel():
     st.subheader("Offline review (recommended for 1000+ rows)")
 
-    cols = st.session_state.active_columns or (
-        list(st.session_state.df.columns) if st.session_state.df is not None else []
-    )
+    cols = st.session_state.active_columns or (list(st.session_state.df.columns) if st.session_state.df is not None else [])
 
     c1, c2 = st.columns([1.2, 1.0])
-
     with c1:
         if st.session_state.df is not None:
-            if not st.session_state.reviewer_name.strip():
-                st.warning("Please enter your name first.")
-            else:
-                pack_bytes = df_to_excel_bytes(st.session_state.df, include_audit=True)
-                pack_name = f"{st.session_state.site}_review_pack_{time.strftime('%Y%m%d_%H%M')}.xlsx"
-
-                st.download_button(
-                    label="📤 Download review pack (Excel)",
-                    data=pack_bytes,
-                    file_name=pack_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
+            pack_bytes = df_to_excel_bytes(st.session_state.df, include_audit=True)
+            pack_name = f"{st.session_state.site}_review_pack_{time.strftime('%Y%m%d_%H%M')}.xlsx"
+            st.download_button(
+                label="📤 Download review pack (Excel)",
+                data=pack_bytes,
+                file_name=pack_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
     with c2:
-        uploaded_xlsx = st.file_uploader(
-            "📥 Upload reviewed Excel (review pack)",
-            type=["xlsx"],
-            key="upload_review_pack_inside_review"
-        )
+        uploaded_xlsx = st.file_uploader("📥 Upload reviewed Excel (review pack)", type=["xlsx"], key="upload_review_pack_inside_review")
 
     if uploaded_xlsx is not None:
         try:
@@ -1484,6 +1474,14 @@ def render_review_step():
     reviewer_col = (schema.get("reviewer_col") or REVIEWER_COL).strip()
     reviewed_at_col = (schema.get("reviewed_at_col") or REVIEWED_AT_COL).strip()
 
+    # Force Review OK to real boolean immediately before rendering.
+    # This is required because values may arrive from Excel/extractor as strings
+    # like "false", "☐", or "☑". Streamlit only renders CheckboxColumn
+    # when the column is boolean, not object/string.
+    if ok_col in df.columns:
+        df[ok_col] = coerce_review_ok_series(df[ok_col])
+        st.session_state.df = df
+
     is_locked = (st.session_state.review_status == "Approved")
 
     f1, f2 = st.columns([1.5, 2.2])
@@ -1506,7 +1504,8 @@ def render_review_step():
 
     if st.session_state.view_mode == "Not reviewed only":
         if ok_col in view.columns:
-            view = view.loc[~view[ok_col].astype(bool)]
+            view[ok_col] = coerce_review_ok_series(view[ok_col])
+            view = view.loc[~view[ok_col]]
         else:
             st.warning(f"Column '{ok_col}' not found for this site.")
 
@@ -1519,6 +1518,8 @@ def render_review_step():
         view = view[mask]
 
     view = view[cols].copy()
+    if ok_col in view.columns:
+        view[ok_col] = coerce_review_ok_series(view[ok_col])
 
     total = len(view)
     st.caption(f"Showing all rows: {total:,}")
@@ -1529,11 +1530,18 @@ def render_review_step():
         st.caption("Check 'Reviewed & OK' when a row is reviewed. After edits, click 'Validate table' (QA action).")
 
     page_view = view.copy()
+    if ok_col in page_view.columns:
+        page_view[ok_col] = coerce_review_ok_series(page_view[ok_col])
     before_page = df.loc[page_view.index].copy()
+    if ok_col in before_page.columns:
+        before_page[ok_col] = coerce_review_ok_series(before_page[ok_col])
 
     TABLE_HEIGHT = 900
 
-    if HAS_AGGRID:
+    # Use Streamlit data_editor for the review table because it reliably renders
+    # boolean columns as real checkboxes. AG Grid can display booleans as text
+    # unless custom checkbox renderers are configured.
+    if False and HAS_AGGRID:
         gb = GridOptionsBuilder.from_dataframe(page_view)
         gb.configure_default_column(editable=not is_locked, filter=True, sortable=True, resizable=True)
         gb.configure_pagination(enabled=False)
@@ -1574,8 +1582,9 @@ def render_review_step():
                 df.loc[edited_page.index, col] = edited_page[col]
 
             if ok_col in df.columns:
-                was_ok = before_page[ok_col].astype(bool)
-                is_ok = df.loc[edited_page.index, ok_col].astype(bool)
+                df[ok_col] = coerce_review_ok_series(df[ok_col])
+                was_ok = coerce_review_ok_series(before_page[ok_col])
+                is_ok = coerce_review_ok_series(df.loc[edited_page.index, ok_col])
 
                 newly_ok_idx = edited_page.index[(was_ok == False) & (is_ok == True)].tolist()
                 if newly_ok_idx:
@@ -1623,16 +1632,14 @@ def _build_excel_bytes_cached(df_csv: str, include_audit: bool, audit_csv: str, 
     review_df = pd.read_csv(io.StringIO(review_csv)) if review_csv else pd.DataFrame()
     audit_df = pd.read_csv(io.StringIO(audit_csv)) if audit_csv else pd.DataFrame()
 
-    safe_df = clean_df_for_excel(df)
-    safe_review_df = clean_df_for_excel(review_df)
-    safe_audit_df = clean_df_for_excel(audit_df)
+    export_df = review_ok_to_excel_symbols(df)
 
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as w:
-        safe_df.to_excel(w, index=False, sheet_name="Extracted")
-        safe_review_df.to_excel(w, index=False, sheet_name="Review")
+        export_df.to_excel(w, index=False, sheet_name="Extracted")
+        review_df.to_excel(w, index=False, sheet_name="Review")
         if include_audit:
-            safe_audit_df.to_excel(w, index=False, sheet_name="Audit log")
+            audit_df.to_excel(w, index=False, sheet_name="Audit log")
     return out.getvalue()
 
 
@@ -1661,7 +1668,7 @@ def render_export_step():
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    propagate_reviewer_to_df(fill_all_rows=True)
+    propagate_reviewer_to_df(fill_all_rows=False)
 
     df_csv = st.session_state.df.to_csv(index=False)
     review_df = make_review_sheet_df()
@@ -1700,7 +1707,4 @@ elif st.session_state.view_step == "Review":
 elif st.session_state.view_step == "Export Excel":
     render_export_step()
 
-
 st.markdown(f"<div class='footer-version'>Tool version: {TOOL_VERSION}</div>", unsafe_allow_html=True)
-
-
