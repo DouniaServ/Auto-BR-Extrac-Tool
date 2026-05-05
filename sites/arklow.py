@@ -361,13 +361,18 @@ def is_date_line(text: str) -> bool:
 END_SENT_RE = re.compile(r"[.;:!?)]\s*$")
 STARTS_NEW_ITEM_RE = re.compile(r"^\s*(?:[-•*]|\(?\d+[\).]|[A-Za-z][\).])\s+", re.IGNORECASE)
 
+CONTINUATION_WORDS = (
+    "and", "or", "to", "of", "the", "a", "an", "in", "at", "on", "for",
+    "with", "without", "from", "into", "by", "as", "per", "before", "after",
+    "during", "within", "while", "until", "start", "end", "result", "range"
+)
 CONTINUATION_START_RE = re.compile(
-    r"^(?:and|or|to|of|the|a|an|in|at|on|for|with|without|from|into|by|as|per)\b",
+    r"^(?:" + "|".join(map(re.escape, CONTINUATION_WORDS)) + r")\b",
     re.IGNORECASE,
 )
 END_DANGLING_RE = re.compile(
     r"""(?ix)
-    (?:\b(and|or|to|of|the|a|an|in|at|on|for|with|without|from|into|by|as|per)\b\s*$)
+    (?:\b(?:""" + "|".join(map(re.escape, CONTINUATION_WORDS)) + r""")\b\s*$)
     |(?:[/:,-]\s*$)
     """
 )
@@ -407,7 +412,27 @@ class LineObj:
     words: List[Word]
     page_h: float
 
+def is_table_value_like(text: str) -> bool:
+    """True for values that should usually stay in their own table cell/row."""
+    t = norm(text)
+    if not t:
+        return False
+    if is_quantity_with_unit(t):
+        return True
+    if re.search(r"[<>≤≥]\s*\d", t):
+        return True
+    if re.fullmatch(r"\d+(?:[.,]\d+)?\s*(?:rpm|sec|s|min|mins|h|hrs|hz|bar|hpa|kg|g|mg|l|ml|%|°c|c)\b.*", t, re.IGNORECASE):
+        return True
+    return False
+
+
 def should_merge_wrapped(prev: LineObj, cur: LineObj) -> bool:
+    """
+    Merge only real wrapped text from the same visual cell/paragraph.
+
+    This intentionally avoids broad semantic merging because it can join unrelated
+    table rows, e.g. Product temperature + Wetting Cycle, or multiple instructions.
+    """
     if prev.page != cur.page:
         return False
 
@@ -416,44 +441,67 @@ def should_merge_wrapped(prev: LineObj, cur: LineObj) -> bool:
     if not p or not c:
         return False
 
-    if STARTS_NEW_ITEM_RE.match(c):
-        return False
-
+    # Never merge headings, sections, stages, checkbox rows, or new bullet/list rows.
     if STAGE_RE.match(p) or STAGE_RE.match(c):
         return False
     if SECTION_RE.match(p) or SECTION_RE.match(c):
         return False
-
-    if END_SENT_RE.search(p):
+    if NO_STAGE_SECTION_RE.match(c):
+        return False
+    if STARTS_NEW_ITEM_RE.match(c):
+        return False
+    if checkbox_tag_for_line(p) or checkbox_tag_for_line(c):
         return False
 
-    if not looks_like_continuation(c):
+    # Never merge a new clear instruction into the previous text.
+    # Exception: lowercase continuation lines are handled below.
+    if starts_with_verb_instruction(c) and not re.match(r"^[a-z]", c):
         return False
 
     x_diff = abs(prev.x - cur.x)
-    y_gap = (cur.y - prev.y)
+    y_gap = cur.y - prev.y
+    same_block = prev.block == cur.block
+    x_close = x_diff <= 18.0
 
-    if y_gap < -1:
+    if y_gap < -1 or y_gap > 24.0:
         return False
 
-    p_dangling = bool(END_DANGLING_RE.search(p))
-    if x_diff <= 12.0 and y_gap <= 16.0:
+    # Avoid merging separate table value rows/cells such as:
+    # Product temperature / at end ≥ 38 °C / The quantity...
+    if is_table_value_like(c) and not END_DANGLING_RE.search(p):
+        return False
+
+    continuation = (
+        re.match(r"^[a-z]", c) is not None
+        or CONTINUATION_START_RE.match(c) is not None
+        or END_DANGLING_RE.search(p) is not None
+    )
+    if not continuation:
+        return False
+
+    # If previous sentence is finished, only merge when the next line is clearly
+    # lowercase continuation. This prevents joining two different instructions.
+    if END_SENT_RE.search(p) and not re.match(r"^[a-z]", c):
+        return False
+
+    # Main safe case: same PyMuPDF block and same visual x-position.
+    if same_block and x_close:
         return True
-    if p_dangling and x_diff <= 40.0 and y_gap <= 30.0:
+
+    # PIP/material tables often split one cell into adjacent PDF blocks with
+    # shifted x positions. Allow lowercase continuation across nearby blocks.
+    # This merges examples like:
+    #   "Verify correct Flavonoid Lot Numbers are" +
+    #   "staged in the granulation room."
+    # and:
+    #   "The quantity of purified water" +
+    #   "is dictated by the recipe that was selected ..."
+    if re.match(r"^[a-z]", c) and x_diff <= 90.0 and y_gap <= 24.0:
         return True
 
-    p_words = len(p.split())
-    c_words = len(c.split())
-
-    is_numeric_only = bool(re.fullmatch(r"\d+(?:[.,]\d+)?", c))
-    is_type_like = c.lower().startswith(("type ", "size ", "id ", "no ", "number "))
-
-    if (
-        prev.x <= 260 and cur.x <= 260
-        and y_gap <= 70.0
-        and x_diff <= 90.0
-        and ((p_words <= 6 and c_words <= 6) or is_numeric_only or is_type_like)
-    ):
+    # Some PDFs split a single cell across adjacent blocks. Permit when
+    # previous line ends dangling, such as "at", "of", "are", comma, hyphen.
+    if END_DANGLING_RE.search(p) and x_diff <= 160.0 and y_gap <= 24.0:
         return True
 
     return False
@@ -801,14 +849,19 @@ def infer_boundaries_from_words(header_words: List[Word]) -> List[float]:
 def split_cells(words: List[Word], boundaries: List[float]) -> List[str]:
     if not words:
         return []
-    ws = sorted(words, key=lambda w: w.x0)
+
+    # Assign to columns by x, but preserve natural reading order inside each cell.
+    # The old version sorted only by x, which changed wrapped text like:
+    #   "... at start of the" + "Granulation."
+    # into "Dispense Granulation. Flavonoide ...".
     cols = [[] for _ in range(len(boundaries) + 1)]
-    for w in ws:
+    for w in sorted(words, key=lambda z: (z.y0, z.x0)):
         k = 0
         while k < len(boundaries) and w.x0 > boundaries[k]:
             k += 1
         cols[k].append(w)
-    return [norm(" ".join(w.text for w in col)) for col in cols]
+
+    return [norm(" ".join(w.text for w in sorted(col, key=lambda z: (z.y0, z.x0)))) for col in cols]
 
 @dataclass
 class Schema:
@@ -1468,6 +1521,53 @@ def extract_to_excel(
         # ---------------- TABLE block ----------------
         in_table = bool(active_schema and active_schema.kind in {"MATERIALS", "PIP"})
         if in_table:
+            # PIP tables are visually 3-column, but PyMuPDF often splits one logical
+            # cell/row into several artificial cells. Emit the full reconstructed line
+            # so rows like "Product temperature at end ≥ 38 °C" and wrapped
+            # requirement text stay together.
+            if active_schema.kind == "PIP":
+                cb_tag = checkbox_tag_for_line(ln.text)
+                if cb_tag:
+                    tag = cb_tag
+                elif starts_with_verb_instruction(ln.text):
+                    tag = "INSTRUCTION"
+                elif is_date_line(ln.text):
+                    tag = "DATE"
+                elif is_quantity_with_unit(ln.text):
+                    tag = "QUANTITY_REQUIRED"
+                else:
+                    tag = "TEXT"
+
+                data_number += 1
+                rows.append({
+                    "PDF name": pdf_name,
+                    "Data number": data_number,
+                    "Page number": ln.page,
+                    "Paragraph number": para_num,
+                    "Process step": process_step,
+                    "Sub process step": current_sub if current_sub else "--",
+                    "Data title": normalize_special_glyphs(ln.text),
+                    "Tag data": tag_data_safe(tag),
+                })
+                return
+
+            # Full-width instruction/paragraph cells should not be split by table
+            # column boundaries. Otherwise a wrapped instruction that crosses a
+            # boundary becomes two extracted rows, e.g. "... at" / "start of the".
+            if starts_with_verb_instruction(ln.text):
+                data_number += 1
+                rows.append({
+                    "PDF name": pdf_name,
+                    "Data number": data_number,
+                    "Page number": ln.page,
+                    "Paragraph number": para_num,
+                    "Process step": process_step,
+                    "Sub process step": current_sub if current_sub else "--",
+                    "Data title": normalize_special_glyphs(ln.text),
+                    "Tag data": "INSTRUCTION",
+                })
+                return
+
             cells = split_cells(ln.words or [], active_schema.boundaries)
 
             if active_schema.kind == "MATERIALS":
