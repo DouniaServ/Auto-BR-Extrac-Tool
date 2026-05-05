@@ -1309,6 +1309,8 @@ def render_setup_step():
 # =============================================================================
 # Step 2: Review
 # =============================================================================
+
+
 def render_review_metadata_panel():
     st.subheader("Reviewer / status")
 
@@ -1318,7 +1320,7 @@ def render_review_metadata_panel():
         new_reviewer = st.text_input(
             "Reviewer name",
             value=st.session_state.reviewer_name,
-            placeholder="Required for approval/export",
+            placeholder="Required for approval/export/download",
         )
 
     if new_reviewer != st.session_state.reviewer_name:
@@ -1351,12 +1353,17 @@ def render_review_metadata_panel():
             if needs_product():
                 st.error("Product name is required to approve. Please fill it in Step 1.")
                 return
+
             if not st.session_state.reviewer_name.strip():
                 st.error("Reviewer name is required to approve.")
                 return
 
-            st.session_state.validation = validate_df(st.session_state.df, st.session_state.active_schema)
+            st.session_state.validation = validate_df(
+                st.session_state.df,
+                st.session_state.active_schema,
+            )
             st.session_state.user_validated = True
+
             err_n = len(st.session_state.validation.errors)
             warn_n = len(st.session_state.validation.warnings)
 
@@ -1364,7 +1371,11 @@ def render_review_metadata_panel():
                 st.session_state.validation_status = f"Validated with notes ⚠️ ({err_n} items)"
                 st.error("Approval blocked: some required fields are missing.")
                 with st.expander("Show details"):
-                    st.dataframe(st.session_state.validation.errors, use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        st.session_state.validation.errors,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
                 audit("validated_on_approve_blocked", f"errors={err_n}; warnings={warn_n}")
                 return
 
@@ -1373,7 +1384,13 @@ def render_review_metadata_panel():
             df = st.session_state.df
             schema = st.session_state.active_schema or {}
             ok_col = (schema.get("review_ok_col") or REVIEW_OK_COL).strip()
-            not_reviewed = int((~coerce_review_ok_series(df[ok_col])).sum()) if (df is not None and ok_col in df.columns) else 0
+
+            not_reviewed = (
+                int((~coerce_review_ok_series(df[ok_col])).sum())
+                if df is not None and ok_col in df.columns
+                else 0
+            )
+
             if not_reviewed > 0:
                 st.error(f"Approval blocked: {not_reviewed} rows are not reviewed yet.")
                 return
@@ -1383,7 +1400,12 @@ def render_review_metadata_panel():
             st.session_state.review_status = "Approved"
             st.session_state.reviewed_at = time.strftime("%Y-%m-%d %H:%M:%S")
             st.session_state.baseline_hash = df_content_hash(st.session_state.df)
-            audit("approved", f"reviewer={st.session_state.reviewer_name}; hash={st.session_state.baseline_hash}")
+
+            audit(
+                "approved",
+                f"reviewer={st.session_state.reviewer_name}; hash={st.session_state.baseline_hash}",
+            )
+
             st.success("Approved and locked ✅")
             st.rerun()
 
@@ -1395,29 +1417,60 @@ def render_review_metadata_panel():
             st.rerun()
 
     with c3:
-        st.caption("Tip: Check 'Reviewed & OK' when a row is verified. Reviewer and timestamp will be auto-filled.")
-
+        st.caption(
+            "Tip: Check 'Reviewed & OK' when a row is verified. Reviewer and timestamp will be auto-filled."
+        )
 
 def render_review_pack_panel():
     st.subheader("Offline review (recommended for 1000+ rows)")
 
-    cols = st.session_state.active_columns or (list(st.session_state.df.columns) if st.session_state.df is not None else [])
+    cols = st.session_state.active_columns or (
+        list(st.session_state.df.columns) if st.session_state.df is not None else []
+    )
 
     c1, c2 = st.columns([1.2, 1.0])
+
     with c1:
         if st.session_state.df is not None:
-            pack_bytes = df_to_excel_bytes(st.session_state.df, include_audit=True)
-            pack_name = f"{st.session_state.site}_review_pack_{time.strftime('%Y%m%d_%H%M')}.xlsx"
-            st.download_button(
-                label="📤 Download review pack (Excel)",
-                data=pack_bytes,
-                file_name=pack_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+
+            reviewer_ok = bool((st.session_state.reviewer_name or "").strip())
+
+            confirm_pack = st.checkbox(
+                "I confirm reviewer name is entered before downloading",
+                key="confirm_review_pack"
             )
 
+            if not reviewer_ok:
+                st.error("❌ Reviewer name is mandatory before downloading the review pack.")
+
+            can_download = reviewer_ok and confirm_pack
+
+            if can_download:
+                propagate_reviewer_to_df(fill_all_rows=False)
+
+                pack_bytes = df_to_excel_bytes(st.session_state.df, include_audit=True)
+                pack_name = f"{st.session_state.site}_review_pack_{time.strftime('%Y%m%d_%H%M')}.xlsx"
+
+                st.download_button(
+                    label="📤 Download review pack (Excel)",
+                    data=pack_bytes,
+                    file_name=pack_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            else:
+                st.button(
+                    "📤 Download review pack (Excel)",
+                    disabled=True,
+                    use_container_width=True,
+                )
+
     with c2:
-        uploaded_xlsx = st.file_uploader("📥 Upload reviewed Excel (review pack)", type=["xlsx"], key="upload_review_pack_inside_review")
+        uploaded_xlsx = st.file_uploader(
+            "📥 Upload reviewed Excel (review pack)",
+            type=["xlsx"],
+            key="upload_review_pack_inside_review"
+        )
 
     if uploaded_xlsx is not None:
         try:
@@ -1430,7 +1483,10 @@ def render_review_pack_panel():
             st.session_state.extraction_source = "review_pack"
             st.session_state.extraction_rows = int(len(new_df))
 
-            st.session_state.validation = validate_df(st.session_state.df, st.session_state.active_schema)
+            st.session_state.validation = validate_df(
+                st.session_state.df,
+                st.session_state.active_schema
+            )
             st.session_state.review_status = "In review"
             audit("review_pack_uploaded", f"name={uploaded_xlsx.name}; rows={len(new_df)}")
 
@@ -1438,7 +1494,11 @@ def render_review_pack_panel():
 
             if old_df is not None:
                 st.caption("Change summary (counts of changed cells per column):")
-                st.dataframe(diff_summary(old_df, new_df, cols), use_container_width=True, hide_index=True)
+                st.dataframe(
+                    diff_summary(old_df, new_df, cols),
+                    use_container_width=True,
+                    hide_index=True
+                )
 
         except Exception as e:
             st.error(f"Could not import reviewed Excel: {e}")
