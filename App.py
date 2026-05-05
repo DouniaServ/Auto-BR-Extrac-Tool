@@ -1435,17 +1435,23 @@ def render_review_pack_panel():
 
             reviewer_ok = bool((st.session_state.reviewer_name or "").strip())
 
-            confirm_pack = st.checkbox(
-                "I confirm reviewer name is entered before downloading",
-                key="confirm_review_pack"
-            )
+            if reviewer_ok:
+                st.markdown(
+                    """
+                    <div style="
+                        background: rgba(0, 180, 120, 0.15);
+                        border: 1px solid rgba(0,255,170,0.4);
+                        border-radius: 12px;
+                        padding: 10px;
+                        font-weight: 900;
+                        color: white;
+                    ">
+                        ✅ Reviewer name entered. Review pack is ready to download.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
-            if not reviewer_ok:
-                st.error("❌ Reviewer name is mandatory before downloading the review pack.")
-
-            can_download = reviewer_ok and confirm_pack
-
-            if can_download:
                 propagate_reviewer_to_df(fill_all_rows=False)
 
                 pack_bytes = df_to_excel_bytes(st.session_state.df, include_audit=True)
@@ -1458,13 +1464,29 @@ def render_review_pack_panel():
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
+
             else:
+                st.markdown(
+                    """
+                    <div style="
+                        background: rgba(255, 255, 255, 0.08);
+                        border: 1px solid rgba(255,255,255,0.3);
+                        border-radius: 12px;
+                        padding: 10px;
+                        font-weight: 900;
+                        color: white;
+                    ">
+                        ℹ️ Please enter reviewer name above to enable download.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
                 st.button(
                     "📤 Download review pack (Excel)",
                     disabled=True,
                     use_container_width=True,
                 )
-
     with c2:
         uploaded_xlsx = st.file_uploader(
             "📥 Upload reviewed Excel (review pack)",
