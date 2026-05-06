@@ -1894,7 +1894,7 @@ def extract(file_bytes: bytes, file_name: str, product_name: Optional[str] = Non
     if ext != ".pdf":
         raise ValueError("Extractor expects a PDF file.")
 
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+    with tempfile.TemporaryDirectory as td:
         pdf_path = os.path.join(td, "input.pdf")
         with open(pdf_path, "wb") as f:
             f.write(file_bytes)
