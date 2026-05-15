@@ -12,6 +12,8 @@ from typing import List, Optional, Tuple, Dict, Any
 
 import pandas as pd
 import streamlit as st
+import openpyxl  # needed to preserve VBA from template.xlsm
+from openpyxl.styles import Alignment, Font
 
 # Optional AG Grid
 HAS_AGGRID = False
@@ -25,7 +27,7 @@ except Exception:
 # =============================================================================
 # Tool version (V1.0)
 # =============================================================================
-TOOL_VERSION = "1.0.0"  
+TOOL_VERSION = "1.0.0"
 
 # =============================================================================
 # Extractor loader (keeps each site's logic untouched)
@@ -466,6 +468,7 @@ def ss_init():
 
     ss.setdefault("active_schema", get_active_schema(ss.site))
     ss.setdefault("active_columns", derive_columns_from_schema_or_df(ss.df, ss.active_schema))
+    ss.setdefault("extraction_control_df", pd.DataFrame())
 
 
 def audit(event: str, details: str = ""):
@@ -534,7 +537,29 @@ def enforce_step_guard_soft():
             st.session_state.view_step = "Setup"
             st.stop()
 
+def style_checklist_column(ws, header_name=REVIEW_OK_COL):
+    checklist_col = None
 
+    for cell in ws[1]:
+        if str(cell.value).strip() == header_name:
+            checklist_col = cell.column
+            break
+
+    if checklist_col is None:
+        return
+
+    for row in range(2, ws.max_row + 1):
+        cell = ws.cell(row=row, column=checklist_col)
+
+        value = str(cell.value).strip().lower()
+
+        if value in {"true", "1", "yes", "y", "checked", "☑", "☒", "✓", "✔", "x", "þ"}:
+            cell.value = "þ"   # checked checkbox in Wingdings
+        else:
+            cell.value = "¨"   # unchecked checkbox in Wingdings
+
+        cell.font = Font(name="Wingdings", size=16, bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
 # =============================================================================
 # Hash + dirty
 # =============================================================================
@@ -634,7 +659,7 @@ def validate_df(df: pd.DataFrame, schema: Dict[str, Any]) -> ValidationResult:
 
 
 # =============================================================================
-# Excel helpers
+# Excel helpers (review sheet, parse, diff)
 # =============================================================================
 def make_review_sheet_df() -> pd.DataFrame:
     skipped = st.session_state.skipped_pages or []
@@ -670,20 +695,6 @@ def make_review_sheet_df() -> pd.DataFrame:
     )
 
 
-def df_to_excel_bytes(df: pd.DataFrame, include_audit: bool = True) -> bytes:
-    propagate_reviewer_to_df(fill_all_rows=False)
-
-    export_df = review_ok_to_excel_symbols(df)
-
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as w:
-        export_df.to_excel(w, index=False, sheet_name="Extracted")
-        make_review_sheet_df().to_excel(w, index=False, sheet_name="Review")
-        if include_audit:
-            pd.DataFrame(st.session_state.audit_log).to_excel(w, index=False, sheet_name="Audit log")
-    return out.getvalue()
-
-
 def parse_review_sheet(review_df: Optional[pd.DataFrame]) -> Dict[str, str]:
     if review_df is None or len(review_df) == 0:
         return {}
@@ -714,7 +725,7 @@ def diff_summary(old: pd.DataFrame, new: pd.DataFrame, cols: List[str]) -> pd.Da
 
 
 # =============================================================================
-# NEW: robust Excel sheet name handling
+# Robust Excel sheet name handling
 # =============================================================================
 def _norm_sheet_name(s: str) -> str:
     return str(s).strip().lower()
@@ -761,7 +772,6 @@ ALIASES_TO_CANONICAL = {
 }
 
 
-
 def coerce_review_ok_series(s: pd.Series) -> pd.Series:
     """
     Normalize Review OK values for the app checkbox.
@@ -786,12 +796,14 @@ def coerce_review_ok_series(s: pd.Series) -> pd.Series:
     return s.map(one).astype(bool)
 
 
+
 def review_ok_to_excel_symbols(df: pd.DataFrame) -> pd.DataFrame:
-    """Use symbols only for exported Excel; keep app data boolean."""
     out = df.copy()
+
     if REVIEW_OK_COL in out.columns:
         ok = coerce_review_ok_series(out[REVIEW_OK_COL])
-        out[REVIEW_OK_COL] = ok.map(lambda x: "☑" if x else "☐")
+        out[REVIEW_OK_COL] = ok.map(lambda x: "þ" if x else "¨")
+
     return out
 
 def ensure_workflow_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -811,6 +823,136 @@ def ensure_workflow_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     df[REVIEW_OK_COL] = coerce_review_ok_series(df[REVIEW_OK_COL])
     return df
+
+
+# =============================================================================
+# Macro-enabled Excel export
+# =============================================================================
+# Path to the macro-enabled template (.xlsm). Created once, kept next to app.py.
+# The template must contain three empty sheets ("Extracted", "Review", "Audit log")
+# and the VBA Worksheet_BeforeDoubleClick on the "Extracted" sheet that
+# toggles ☑/☐ and stamps the date in "Reviewed at".
+MACRO_TEMPLATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "template.xlsm",
+)
+
+EXT_XLSM = "xlsm"
+EXT_XLSX = "xlsx"
+MIME_XLSM = "application/vnd.ms-excel.sheet.macroEnabled.12"
+MIME_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _macro_template_available() -> bool:
+    return os.path.exists(MACRO_TEMPLATE_PATH)
+
+
+def _clear_worksheet(ws) -> None:
+    """Remove all rows but keep the sheet — preserves its VBA code module binding."""
+    if ws.max_row and ws.max_row >= 1:
+        ws.delete_rows(1, ws.max_row)
+
+
+def _write_df_to_worksheet(ws, df: pd.DataFrame) -> None:
+    """Write a DataFrame to an openpyxl worksheet starting at A1."""
+    if df is None:
+        return
+
+    for j, col in enumerate(df.columns, start=1):
+        ws.cell(row=1, column=j, value=str(col))
+
+    if df.empty:
+        return
+
+    for i, row in enumerate(df.itertuples(index=False, name=None), start=2):
+        for j, val in enumerate(row, start=1):
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                ws.cell(row=i, column=j, value=None)
+            else:
+                ws.cell(row=i, column=j, value=val)
+
+    style_checklist_column(ws, REVIEW_OK_COL)
+
+
+def build_excel_bytes_macro(
+    extracted_df: pd.DataFrame,
+    review_df: pd.DataFrame,
+    audit_df: Optional[pd.DataFrame],
+    include_audit: bool = True,
+) -> Tuple[bytes, str, str]:
+    """
+    Build the export workbook.
+    Returns (file_bytes, mime_type, extension).
+    """
+    export_df = review_ok_to_excel_symbols(extracted_df)
+
+    control_df = (
+        st.session_state.extraction_control_df
+        if hasattr(st.session_state, "extraction_control_df")
+        and isinstance(st.session_state.extraction_control_df, pd.DataFrame)
+        else pd.DataFrame()
+    )
+
+    if _macro_template_available():
+        try:
+            wb = openpyxl.load_workbook(MACRO_TEMPLATE_PATH, keep_vba=True)
+
+            for sheet_name, df_to_write in [
+                ("Extracted", export_df),
+                ("Review", review_df),
+                ("Extraction control", control_df),
+            ]:
+                if sheet_name not in wb.sheetnames:
+                    wb.create_sheet(sheet_name)
+
+                ws = wb[sheet_name]
+                _clear_worksheet(ws)
+                _write_df_to_worksheet(ws, df_to_write)
+
+            if include_audit:
+                if "Audit log" not in wb.sheetnames:
+                    wb.create_sheet("Audit log")
+
+                ws = wb["Audit log"]
+                _clear_worksheet(ws)
+                _write_df_to_worksheet(
+                    ws,
+                    audit_df if audit_df is not None else pd.DataFrame()
+                )
+
+            out = io.BytesIO()
+            wb.save(out)
+            return out.getvalue(), MIME_XLSM, EXT_XLSM
+
+        except Exception as e:
+            audit("macro_template_failed_fallback_xlsx", f"{type(e).__name__}: {e}")
+
+    # Fallback: plain .xlsx
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        export_df.to_excel(w, index=False, sheet_name="Extracted")
+        review_df.to_excel(w, index=False, sheet_name="Review")
+        control_df.to_excel(w, index=False, sheet_name="Extraction control")
+
+        if include_audit:
+            (audit_df if audit_df is not None else pd.DataFrame()).to_excel(
+                w,
+                index=False,
+                sheet_name="Audit log"
+            )
+
+    return out.getvalue(), MIME_XLSX, EXT_XLSX
+
+
+def df_to_excel_bytes(df: pd.DataFrame, include_audit: bool = True) -> Tuple[bytes, str, str]:
+    """
+    Thin wrapper used by the review-pack download in Step 2.
+    Returns (file_bytes, mime_type, extension).
+    """
+    propagate_reviewer_to_df(fill_all_rows=False)
+    review_df = make_review_sheet_df()
+    audit_df = pd.DataFrame(st.session_state.audit_log) if include_audit else None
+    return build_excel_bytes_macro(df, review_df, audit_df, include_audit)
 
 
 # =============================================================================
@@ -863,6 +1005,7 @@ def maybe_auto_extract():
     ss.extraction_rows = int(len(df))
 
     ss.df = df
+    ss.extraction_control_df = df.attrs.get("extraction_control", pd.DataFrame())
     ss.active_schema = schema
     ss.active_columns = derive_columns_from_schema_or_df(ss.df, ss.active_schema)
 
@@ -1034,6 +1177,8 @@ from **empty Batch Record templates**, with the output aligned to the toolbox te
 - Review & correct
 - Validation status only changes when you click "Validate table" or "Approve & lock"
 - Approve + Export final Excel
+- Downloaded Excel files are macro-enabled (.xlsm) when template.xlsm is present:
+  double-click the "Reviewed & OK" cell to toggle ☑ and stamp the date automatically.
             """
         )
 
@@ -1266,11 +1411,10 @@ def render_setup_step():
         st.markdown("#### Upload Review Pack (Excel) to resume review (even next day)")
         uploaded_xlsx = st.file_uploader(
             label="Upload Review Pack (Excel)",
-            type=["xlsx"],
+            type=["xlsx", "xlsm"],
             key="uploader_review_pack",
-            help="Upload the Excel pack previously downloaded from this tool.",
+            help="Upload the Excel pack previously downloaded from this tool (.xlsx or .xlsm).",
             label_visibility="collapsed",
-
         )
         if uploaded_xlsx is not None:
             try:
@@ -1309,8 +1453,6 @@ def render_setup_step():
 # =============================================================================
 # Step 2: Review
 # =============================================================================
-
-
 def render_review_metadata_panel():
     st.subheader("Reviewer / status")
 
@@ -1421,6 +1563,7 @@ def render_review_metadata_panel():
             "Tip: Check 'Reviewed & OK' when a row is verified. Reviewer and timestamp will be auto-filled."
         )
 
+
 def render_review_pack_panel():
     st.subheader("Offline review (recommended for 1000+ rows)")
 
@@ -1436,8 +1579,14 @@ def render_review_pack_panel():
             reviewer_ok = bool((st.session_state.reviewer_name or "").strip())
 
             if reviewer_ok:
+                template_hint = (
+                    "Macro-enabled (.xlsm): double-click 'Reviewed & OK' to toggle ☑ and stamp the date."
+                    if _macro_template_available()
+                    else "Note: template.xlsm not found — file will be plain .xlsx (no macros)."
+                )
+
                 st.markdown(
-                    """
+                    f"""
                     <div style="
                         background: rgba(0, 180, 120, 0.15);
                         border: 1px solid rgba(0,255,170,0.4);
@@ -1446,7 +1595,8 @@ def render_review_pack_panel():
                         font-weight: 900;
                         color: white;
                     ">
-                        ✅ Reviewer name entered. Review pack is ready to download.
+                        ✅ Reviewer name entered. Review pack is ready to download.<br>
+                        <span style="font-weight:700; opacity:0.95;">{template_hint}</span>
                     </div>
                     """,
                     unsafe_allow_html=True,
@@ -1454,14 +1604,16 @@ def render_review_pack_panel():
 
                 propagate_reviewer_to_df(fill_all_rows=False)
 
-                pack_bytes = df_to_excel_bytes(st.session_state.df, include_audit=True)
-                pack_name = f"{st.session_state.site}_review_pack_{time.strftime('%Y%m%d_%H%M')}.xlsx"
+                pack_bytes, pack_mime, pack_ext = df_to_excel_bytes(
+                    st.session_state.df, include_audit=True
+                )
+                pack_name = f"{st.session_state.site}_review_pack_{time.strftime('%Y%m%d_%H%M')}.{pack_ext}"
 
                 st.download_button(
                     label="📤 Download review pack (Excel)",
                     data=pack_bytes,
                     file_name=pack_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    mime=pack_mime,
                     use_container_width=True,
                 )
 
@@ -1490,7 +1642,7 @@ def render_review_pack_panel():
     with c2:
         uploaded_xlsx = st.file_uploader(
             "📥 Upload reviewed Excel (review pack)",
-            type=["xlsx"],
+            type=["xlsx", "xlsm"],
             key="upload_review_pack_inside_review"
         )
 
@@ -1709,20 +1861,35 @@ def render_review_step():
 # Step 3: Export (no freeze; cache bytes)
 # =============================================================================
 @st.cache_data(show_spinner=False)
-def _build_excel_bytes_cached(df_csv: str, include_audit: bool, audit_csv: str, review_csv: str) -> bytes:
+def _build_excel_bytes_cached(
+    df_csv: str,
+    include_audit: bool,
+    audit_csv: str,
+    review_csv: str,
+    template_marker: str,
+) -> Tuple[bytes, str, str]:
+    """
+    Returns (file_bytes, mime_type, extension).
+
+    template_marker is included only to invalidate the cache when the
+    template.xlsm file appears/disappears or is replaced — its value is
+    derived from the template path + its mtime.
+    """
     df = pd.read_csv(io.StringIO(df_csv))
     review_df = pd.read_csv(io.StringIO(review_csv)) if review_csv else pd.DataFrame()
-    audit_df = pd.read_csv(io.StringIO(audit_csv)) if audit_csv else pd.DataFrame()
+    audit_df = pd.read_csv(io.StringIO(audit_csv)) if (include_audit and audit_csv) else None
+    return build_excel_bytes_macro(df, review_df, audit_df, include_audit)
 
-    export_df = review_ok_to_excel_symbols(df)
 
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as w:
-        export_df.to_excel(w, index=False, sheet_name="Extracted")
-        review_df.to_excel(w, index=False, sheet_name="Review")
-        if include_audit:
-            audit_df.to_excel(w, index=False, sheet_name="Audit log")
-    return out.getvalue()
+def _template_cache_marker() -> str:
+    """Cheap fingerprint of template.xlsm so the cached export refreshes if it changes."""
+    if not _macro_template_available():
+        return "no-template"
+    try:
+        st_info = os.stat(MACRO_TEMPLATE_PATH)
+        return f"{MACRO_TEMPLATE_PATH}:{int(st_info.st_mtime)}:{st_info.st_size}"
+    except Exception:
+        return "template-stat-failed"
 
 
 def render_export_step():
@@ -1759,19 +1926,30 @@ def render_export_step():
     audit_csv = audit_df.to_csv(index=False)
 
     with st.spinner("Preparing Excel…"):
-        excel_bytes = _build_excel_bytes_cached(df_csv, True, audit_csv, review_csv)
+        excel_bytes, excel_mime, excel_ext = _build_excel_bytes_cached(
+            df_csv, True, audit_csv, review_csv, _template_cache_marker()
+        )
 
-    filename = f"{st.session_state.site}_FINAL_{time.strftime('%Y%m%d_%H%M')}.xlsx"
+    filename = f"{st.session_state.site}_FINAL_{time.strftime('%Y%m%d_%H%M')}.{excel_ext}"
 
-    st.success(
-        f"Ready to export ✅  Reviewer: {st.session_state.reviewer_name} · Reviewed at: {st.session_state.reviewed_at}"
-    )
+    if excel_ext == EXT_XLSM:
+        st.success(
+            f"Ready to export ✅  Reviewer: {st.session_state.reviewer_name} · "
+            f"Reviewed at: {st.session_state.reviewed_at}  "
+            f"(Macro-enabled: double-click 'Reviewed & OK' to toggle and stamp the date.)"
+        )
+    else:
+        st.success(
+            f"Ready to export ✅  Reviewer: {st.session_state.reviewer_name} · "
+            f"Reviewed at: {st.session_state.reviewed_at}"
+        )
+        st.info("template.xlsm not found — exporting plain .xlsx without macros.")
 
     st.download_button(
         label="📥 Download FINAL Excel",
         data=excel_bytes,
         file_name=filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        mime=excel_mime,
         use_container_width=True,
     )
     audit("final_excel_download_ready", filename)
