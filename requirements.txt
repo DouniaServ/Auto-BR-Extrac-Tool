@@ -5,4 +5,4 @@ pdfplumber==0.11.4
 pdfminer.six==20231228
 pillow==10.4.0
 pymupdf==1.24.10
-streamlit-aggrid==0.3.4.post3
+st-aggrid==0.3.4.post3
