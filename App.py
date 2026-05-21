@@ -658,6 +658,46 @@ def validate_df(df: pd.DataFrame, schema: Dict[str, Any]) -> ValidationResult:
     return ValidationResult(ok, err_df, warn_df, sorted(flagged))
 
 
+
+# =============================================================================
+# Extraction control helpers
+# =============================================================================
+def _first_existing_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+def build_extraction_control_df(ui_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fallback only. Real Extraction Control must come from the extractor,
+    because the app does not have the original PDF path/raw text.
+    """
+    return pd.DataFrame(columns=[
+        "Page number",
+        "Raw line no",
+        "Raw PDF text",
+        "Matched extracted row",
+        "Matched extracted text",
+        "Match score",
+        "Missing tokens",
+        "Coverage status",
+        "Control comment",
+    ])
+
+    
+def get_extractor_control_from_df(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+
+    for key in ("extraction_control", "Extraction control", "Extraction Control"):
+        control = getattr(df, "attrs", {}).get(key)
+        if isinstance(control, pd.DataFrame) and not control.empty:
+            return control.copy()
+
+    return build_extraction_control_df(df)
+
+
 # =============================================================================
 # Excel helpers (review sheet, parse, diff)
 # =============================================================================
@@ -879,6 +919,7 @@ def build_excel_bytes_macro(
     review_df: pd.DataFrame,
     audit_df: Optional[pd.DataFrame],
     include_audit: bool = True,
+    control_df_override: Optional[pd.DataFrame] = None,
 ) -> Tuple[bytes, str, str]:
     """
     Build the export workbook.
@@ -886,12 +927,18 @@ def build_excel_bytes_macro(
     """
     export_df = review_ok_to_excel_symbols(extracted_df)
 
-    control_df = (
-        st.session_state.extraction_control_df
-        if hasattr(st.session_state, "extraction_control_df")
-        and isinstance(st.session_state.extraction_control_df, pd.DataFrame)
-        else pd.DataFrame()
-    )
+    if isinstance(control_df_override, pd.DataFrame):
+        control_df = control_df_override
+    else:
+        control_df = (
+            st.session_state.extraction_control_df
+            if hasattr(st.session_state, "extraction_control_df")
+            and isinstance(st.session_state.extraction_control_df, pd.DataFrame)
+            else pd.DataFrame()
+        )
+
+    if control_df.empty:
+        control_df = build_extraction_control_df(extracted_df)
 
     if _macro_template_available():
         try:
@@ -963,12 +1010,42 @@ def fp(b: bytes) -> str:
 
 
 def extract_by_site(site: str, file_bytes: bytes, file_name: str) -> pd.DataFrame:
+
     extractor = get_extractor(site)
     df = extractor(file_bytes, file_name)
+
+    # Add missing review/workflow columns
     df = ensure_workflow_columns(df)
 
+    # Fill UI metadata for Arklow / Bolbec / Toledo
     df = apply_ui_metadata_to_df(site, df, file_name)
 
+    # Build strong raw-text control BEFORE schema trimming
+    try:
+        import tempfile
+
+        existing_control = getattr(df, "attrs", {}).get("extraction_control")
+
+        if not isinstance(existing_control, pd.DataFrame) or existing_control.empty:
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(file_bytes)
+                tmp_pdf_path = tmp.name
+
+            from extraction_control import build_strong_raw_order_control
+
+            control_df = build_strong_raw_order_control(tmp_pdf_path, df)
+            df.attrs["extraction_control"] = control_df
+
+            try:
+                os.remove(tmp_pdf_path)
+            except Exception:
+                pass
+
+    except Exception as e:
+        audit("raw_text_control_failed", f"{site}: {type(e).__name__}: {e}")
+
+    # Apply site schema columns
     schema = get_active_schema(site)
     cols = schema.get("columns") or list(df.columns)
 
@@ -979,7 +1056,6 @@ def extract_by_site(site: str, file_bytes: bytes, file_name: str) -> pd.DataFram
         df = df[cols].copy()
 
     return df
-
 
 def maybe_auto_extract():
     ss = st.session_state
@@ -1005,7 +1081,7 @@ def maybe_auto_extract():
     ss.extraction_rows = int(len(df))
 
     ss.df = df
-    ss.extraction_control_df = df.attrs.get("extraction_control", pd.DataFrame())
+    ss.extraction_control_df = get_extractor_control_from_df(df)
     ss.active_schema = schema
     ss.active_columns = derive_columns_from_schema_or_df(ss.df, ss.active_schema)
 
@@ -1065,9 +1141,15 @@ def resume_from_review_pack(file_bytes: bytes, file_name: str):
         )
 
     review_sheet = find_sheet_name(xl, "Review") or find_sheet_by_contains(xl, "review")
+    control_sheet = (
+        find_sheet_name(xl, "Extraction control")
+        or find_sheet_name(xl, "Extraction Control")
+        or find_sheet_by_contains(xl, "control")
+    )
 
     extracted = pd.read_excel(xl, extracted_sheet, engine="openpyxl")
     review_df = pd.read_excel(xl, review_sheet, engine="openpyxl") if review_sheet else None
+    control_df = pd.read_excel(xl, control_sheet, engine="openpyxl") if control_sheet else pd.DataFrame()
     meta = parse_review_sheet(review_df)
 
     site = meta.get("Site", "") or st.session_state.site
@@ -1090,6 +1172,10 @@ def resume_from_review_pack(file_bytes: bytes, file_name: str):
         raise ValueError(f"Uploaded Excel missing required columns for site '{site}': {missing}")
 
     st.session_state.df = extracted[expected_cols].copy()
+    st.session_state.extraction_control_df = (
+        control_df if isinstance(control_df, pd.DataFrame) and not control_df.empty
+        else build_extraction_control_df(st.session_state.df)
+    )
     st.session_state.active_columns = expected_cols
 
     st.session_state.validation = validate_df(st.session_state.df, st.session_state.active_schema)
@@ -1866,6 +1952,7 @@ def _build_excel_bytes_cached(
     include_audit: bool,
     audit_csv: str,
     review_csv: str,
+    control_csv: str,
     template_marker: str,
 ) -> Tuple[bytes, str, str]:
     """
@@ -1878,7 +1965,8 @@ def _build_excel_bytes_cached(
     df = pd.read_csv(io.StringIO(df_csv))
     review_df = pd.read_csv(io.StringIO(review_csv)) if review_csv else pd.DataFrame()
     audit_df = pd.read_csv(io.StringIO(audit_csv)) if (include_audit and audit_csv) else None
-    return build_excel_bytes_macro(df, review_df, audit_df, include_audit)
+    control_df = pd.read_csv(io.StringIO(control_csv)) if control_csv else build_extraction_control_df(df)
+    return build_excel_bytes_macro(df, review_df, audit_df, include_audit, control_df_override=control_df)
 
 
 def _template_cache_marker() -> str:
@@ -1925,9 +2013,17 @@ def render_export_step():
     audit_df = pd.DataFrame(st.session_state.audit_log)
     audit_csv = audit_df.to_csv(index=False)
 
+    control_df = (
+        st.session_state.extraction_control_df
+        if isinstance(st.session_state.extraction_control_df, pd.DataFrame)
+        and not st.session_state.extraction_control_df.empty
+        else build_extraction_control_df(st.session_state.df)
+    )
+    control_csv = control_df.to_csv(index=False)
+
     with st.spinner("Preparing Excel…"):
         excel_bytes, excel_mime, excel_ext = _build_excel_bytes_cached(
-            df_csv, True, audit_csv, review_csv, _template_cache_marker()
+            df_csv, True, audit_csv, review_csv, control_csv, _template_cache_marker()
         )
 
     filename = f"{st.session_state.site}_FINAL_{time.strftime('%Y%m%d_%H%M')}.{excel_ext}"
