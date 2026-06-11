@@ -657,8 +657,6 @@ def validate_df(df: pd.DataFrame, schema: Dict[str, Any]) -> ValidationResult:
     ok = len(err_df) == 0
     return ValidationResult(ok, err_df, warn_df, sorted(flagged))
 
-
-
 # =============================================================================
 # Extraction control helpers
 # =============================================================================
@@ -670,32 +668,155 @@ def _first_existing_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str
 
 def build_extraction_control_df(ui_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fallback only. Real Extraction Control must come from the extractor,
-    because the app does not have the original PDF path/raw text.
+    Fallback only. Real Full Source Traceability must come from extraction_control.py
+    because it needs the original PDF/raw text.
     """
     return pd.DataFrame(columns=[
-        "Page number",
-        "Raw line no",
+        "Page",
+        "Source ID",
         "Raw PDF text",
-        "Matched extracted row",
-        "Matched extracted text",
-        "Match score",
-        "Missing tokens",
-        "Coverage status",
-        "Control comment",
+        "Source group",
+        "Reconciliation status",
+        "Matched Extracted reference",
+        "Reviewer note",
     ])
 
-    
-def get_extractor_control_from_df(df: pd.DataFrame) -> pd.DataFrame:
-    if not isinstance(df, pd.DataFrame):
+
+def build_extraction_control_summary_df(control_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Simple Quality summary for the Full Source Traceability sheet.
+    The sheet is traceability support only; the Extracted sheet remains the main review output.
+    """
+    if control_df is None or control_df.empty:
+        return pd.DataFrame(columns=["Metric", "Value"])
+
+    status_col = "Reconciliation status" if "Reconciliation status" in control_df.columns else "Match status"
+    status = control_df[status_col].fillna("").astype(str).str.strip()
+
+    source_group = (
+        control_df["Source group"].fillna("").astype(str).str.strip()
+        if "Source group" in control_df.columns
+        else pd.Series([""] * len(control_df))
+    )
+
+    covered = (
+        status.eq("Reconciled with structured pre-draft")
+        | status.eq("Reconciled with structured pre-draft")
+        | status.eq("Covered")
+    )
+    metadata = status.eq("Document metadata / context") | source_group.eq("Document metadata / context")
+    visible_not_reconciled = (
+        status.eq("Visible in source - not reconciled")
+        | status.eq("Not found in Extracted")
+        | status.eq("Not covered")
+    ) & source_group.eq("Source data")
+
+    return pd.DataFrame([
+        {"Metric": "Total readable source items visible", "Value": int(len(control_df))},
+        {"Metric": "Reconciled with structured pre-draft", "Value": int(covered.sum())},
+        {"Metric": "Document metadata / context", "Value": int(metadata.sum())},
+        {"Metric": "Visible source data not reconciled", "Value": int(visible_not_reconciled.sum())},
+        {"Metric": "Quality position", "Value": "Pre-draft support: main review remains Extracted sheet against the PDF."},
+    ])
+
+
+def build_potential_missing_data_df(control_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Optional support sheet: only source-data rows not reconciled with the Extracted sheet.
+    This avoids asking reviewers to review the full traceability matrix line by line.
+    """
+    cols = [
+        "Page",
+        "Source ID",
+        "Raw PDF text",
+        "Source group",
+        "Reconciliation status",
+        "Matched Extracted reference",
+        "Reviewer note",
+    ]
+
+    if not isinstance(control_df, pd.DataFrame) or control_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    for col in cols:
+        if col not in control_df.columns:
+            control_df[col] = ""
+
+    mask = (
+        control_df["Source group"].fillna("").astype(str).str.strip().eq("Source data")
+        & control_df["Reconciliation status"].fillna("").astype(str).str.strip().isin([
+            "Visible in source - not reconciled",
+            "Not found in Extracted",
+            "Not covered",
+        ])
+    )
+
+    return control_df.loc[mask, cols].copy()
+
+
+def build_extracted_row_control_df(extracted_df: pd.DataFrame, control_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reverse quality control:
+    verifies that each extracted row has at least one supporting raw PDF item.
+    """
+    if not isinstance(extracted_df, pd.DataFrame) or extracted_df.empty:
+        return pd.DataFrame(columns=[
+            "Extracted row",
+            "Page number",
+            "Data title",
+            "Tag",
+            "Support status",
+            "Supporting raw text count",
+            "Reviewer action",
+        ])
+
+    if not isinstance(control_df, pd.DataFrame) or control_df.empty:
+        return pd.DataFrame(columns=[
+            "Extracted row",
+            "Page number",
+            "Data title",
+            "Tag",
+            "Support status",
+            "Supporting raw text count",
+            "Reviewer action",
+        ])
+
+    matched_col = "Matched extracted row"
+    if matched_col not in control_df.columns:
         return pd.DataFrame()
 
-    for key in ("extraction_control", "Extraction control", "Extraction Control"):
-        control = getattr(df, "attrs", {}).get(key)
-        if isinstance(control, pd.DataFrame) and not control.empty:
-            return control.copy()
+    supported_rows = (
+        pd.to_numeric(control_df[matched_col], errors="coerce")
+        .dropna()
+        .astype(int)
+        .value_counts()
+        .to_dict()
+    )
 
-    return build_extraction_control_df(df)
+    rows = []
+
+    for idx, row in extracted_df.iterrows():
+        support_count = int(supported_rows.get(int(idx), 0))
+
+        if support_count > 0:
+            status = "Supported by raw PDF"
+            action = "OK"
+        else:
+            status = "No raw PDF support found"
+            action = "Review extracted row"
+
+        rows.append({
+            "Extracted row": int(idx),
+            "Page number": row.get("Page number", ""),
+            "Data title": row.get("Data title", row.get("Data Title", "")),
+            "Tag": row.get("Tag", row.get("Data tag", "")),
+            "Support status": status,
+            "Supporting raw text count": support_count,
+            "Reviewer action": action,
+        })
+
+    return pd.DataFrame(rows)
+
 
 
 # =============================================================================
@@ -913,7 +1034,6 @@ def _write_df_to_worksheet(ws, df: pd.DataFrame) -> None:
 
     style_checklist_column(ws, REVIEW_OK_COL)
 
-
 def build_excel_bytes_macro(
     extracted_df: pd.DataFrame,
     review_df: pd.DataFrame,
@@ -923,31 +1043,93 @@ def build_excel_bytes_macro(
 ) -> Tuple[bytes, str, str]:
     """
     Build the export workbook.
-    Returns (file_bytes, mime_type, extension).
+
+    Quality-facing design:
+    - Extracted = main pre-draft review sheet
+    - Review = reviewer/status metadata
+    - Full Source Traceability = simple raw-source traceability support
+    - Audit log = user/action traceability
     """
     export_df = review_ok_to_excel_symbols(extracted_df)
 
     if isinstance(control_df_override, pd.DataFrame):
-        control_df = control_df_override
+        control_df = control_df_override.copy()
     else:
         control_df = (
-            st.session_state.extraction_control_df
+            st.session_state.extraction_control_df.copy()
             if hasattr(st.session_state, "extraction_control_df")
             and isinstance(st.session_state.extraction_control_df, pd.DataFrame)
             else pd.DataFrame()
         )
 
-    if control_df.empty:
+    required_control_cols = {
+        "Page",
+        "Source ID",
+        "Raw PDF text",
+        "Source group",
+        "Reconciliation status",
+        "Matched Extracted reference",
+        "Reviewer note",
+    }
+    ordered_control_cols = [
+        "Page",
+        "Source ID",
+        "Raw PDF text",
+        "Source group",
+        "Reconciliation status",
+        "Matched Extracted reference",
+        "Reviewer note",
+    ]
+
+    if control_df.empty or not required_control_cols.issubset(set(control_df.columns)):
+        audit(
+            "invalid_full_source_traceability_export",
+            f"Full Source Traceability is empty or invalid format. Columns found: {list(control_df.columns)}"
+        )
         control_df = build_extraction_control_df(extracted_df)
 
+    for col in ordered_control_cols:
+        if col not in control_df.columns:
+            control_df[col] = ""
+
+    control_df = control_df[ordered_control_cols]
     if _macro_template_available():
         try:
             wb = openpyxl.load_workbook(MACRO_TEMPLATE_PATH, keep_vba=True)
 
+            # Normalize old control sheet names from previous versions.
+            target_sheet = "Full Source Traceability"
+            legacy_candidates = [
+                "Full Source Traceability",
+                "Full PDF Raw Extraction",
+                "Extraction control",
+                "Extraction Control",
+            ]
+
+            if target_sheet not in wb.sheetnames:
+                renamed = False
+                for legacy_sheet in legacy_candidates:
+                    if legacy_sheet in wb.sheetnames:
+                        wb[legacy_sheet].title = target_sheet
+                        renamed = True
+                        break
+                if not renamed:
+                    wb.create_sheet(target_sheet)
+
+            for legacy_sheet in legacy_candidates:
+                if legacy_sheet in wb.sheetnames and legacy_sheet != target_sheet:
+                    wb.remove(wb[legacy_sheet])
+
+            # Remove the optional Potential Missing Data sheet from official review pack.
+            # The pre-draft review remains focused on Extracted + PDF;
+            # Full Source Traceability stays as support evidence only.
+            if "Potential Missing Data" in wb.sheetnames:
+                wb.remove(wb["Potential Missing Data"])
+
             for sheet_name, df_to_write in [
                 ("Extracted", export_df),
                 ("Review", review_df),
-                ("Extraction control", control_df),
+                (target_sheet, control_df),
             ]:
                 if sheet_name not in wb.sheetnames:
                     wb.create_sheet(sheet_name)
@@ -974,12 +1156,12 @@ def build_excel_bytes_macro(
         except Exception as e:
             audit("macro_template_failed_fallback_xlsx", f"{type(e).__name__}: {e}")
 
-    # Fallback: plain .xlsx
     out = io.BytesIO()
+
     with pd.ExcelWriter(out, engine="openpyxl") as w:
         export_df.to_excel(w, index=False, sheet_name="Extracted")
         review_df.to_excel(w, index=False, sheet_name="Review")
-        control_df.to_excel(w, index=False, sheet_name="Extraction control")
+        control_df.to_excel(w, index=False, sheet_name="Full Source Traceability")
 
         if include_audit:
             (audit_df if audit_df is not None else pd.DataFrame()).to_excel(
@@ -990,7 +1172,6 @@ def build_excel_bytes_macro(
 
     return out.getvalue(), MIME_XLSX, EXT_XLSX
 
-
 def df_to_excel_bytes(df: pd.DataFrame, include_audit: bool = True) -> Tuple[bytes, str, str]:
     """
     Thin wrapper used by the review-pack download in Step 2.
@@ -999,18 +1180,46 @@ def df_to_excel_bytes(df: pd.DataFrame, include_audit: bool = True) -> Tuple[byt
     propagate_reviewer_to_df(fill_all_rows=False)
     review_df = make_review_sheet_df()
     audit_df = pd.DataFrame(st.session_state.audit_log) if include_audit else None
-    return build_excel_bytes_macro(df, review_df, audit_df, include_audit)
 
+    return build_excel_bytes_macro(
+        extracted_df=df,
+        review_df=review_df,
+        audit_df=audit_df,
+        include_audit=include_audit,
+    )
 
 # =============================================================================
 # Extraction plumbing
 # =============================================================================
+def get_extractor_control_from_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Get Full Source Traceability control from df.attrs.
+    """
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+
+    required_cols = {
+        "Page",
+        "Source ID",
+        "Raw PDF text",
+        "Source group",
+        "Reconciliation status",
+    }
+
+    for key in ("extraction_control", "Extraction control", "Extraction Control"):
+        control = getattr(df, "attrs", {}).get(key)
+
+        if isinstance(control, pd.DataFrame) and not control.empty:
+            if required_cols.issubset(set(control.columns)):
+                return control.copy()
+
+    return build_extraction_control_df(df)
+
 def fp(b: bytes) -> str:
     return f"{len(b)}:{hash(b[:2048])}"
 
 
 def extract_by_site(site: str, file_bytes: bytes, file_name: str) -> pd.DataFrame:
-
     extractor = get_extractor(site)
     df = extractor(file_bytes, file_name)
 
@@ -1020,32 +1229,47 @@ def extract_by_site(site: str, file_bytes: bytes, file_name: str) -> pd.DataFram
     # Fill UI metadata for Arklow / Bolbec / Toledo
     df = apply_ui_metadata_to_df(site, df, file_name)
 
-    # Build strong raw-text control BEFORE schema trimming
+    # =========================================================
+    # ALWAYS rebuild Full Source Traceability from the PDF.
+    # This keeps all readable raw PDF text visible.
+    # No skipped-by-design / not expected logic.
+    # =========================================================
+    full_raw_df = pd.DataFrame()
+
     try:
         import tempfile
 
-        existing_control = getattr(df, "attrs", {}).get("extraction_control")
+        tmp_pdf_path = None
 
-        if not isinstance(existing_control, pd.DataFrame) or existing_control.empty:
-
+        try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(file_bytes)
                 tmp_pdf_path = tmp.name
 
             from extraction_control import build_strong_raw_order_control
 
-            control_df = build_strong_raw_order_control(tmp_pdf_path, df)
-            df.attrs["extraction_control"] = control_df
+            full_raw_df = build_strong_raw_order_control(
+                tmp_pdf_path,
+                df,
+                threshold_extracted=0.85,
+                threshold_partial=0.40,
+                include_summary=False,
+            )
 
-            try:
-                os.remove(tmp_pdf_path)
-            except Exception:
-                pass
+        finally:
+            if tmp_pdf_path and os.path.exists(tmp_pdf_path):
+                try:
+                    os.remove(tmp_pdf_path)
+                except Exception:
+                    pass
 
     except Exception as e:
-        audit("raw_text_control_failed", f"{site}: {type(e).__name__}: {e}")
+        audit("full_raw_extraction_failed", f"{site}: {type(e).__name__}: {e}")
+        full_raw_df = build_extraction_control_df(df)
 
-    # Apply site schema columns
+    # =========================================================
+    # Apply site schema columns to Extracted sheet only
+    # =========================================================
     schema = get_active_schema(site)
     cols = schema.get("columns") or list(df.columns)
 
@@ -1053,9 +1277,14 @@ def extract_by_site(site: str, file_bytes: bytes, file_name: str) -> pd.DataFram
         missing = [c for c in cols if c not in df.columns]
         if missing:
             raise ValueError(f"Extractor for {site} returned missing columns: {missing}")
+
         df = df[cols].copy()
 
+    # Reattach Full Source Traceability AFTER df copy/schema trim
+    df.attrs["extraction_control"] = full_raw_df
+
     return df
+
 
 def maybe_auto_extract():
     ss = st.session_state
@@ -1142,8 +1371,12 @@ def resume_from_review_pack(file_bytes: bytes, file_name: str):
 
     review_sheet = find_sheet_name(xl, "Review") or find_sheet_by_contains(xl, "review")
     control_sheet = (
-        find_sheet_name(xl, "Extraction control")
+        find_sheet_name(xl, "Full Source Traceability")
+        or find_sheet_name(xl, "Full Source Coverage Matrix")
+        or find_sheet_name(xl, "Full PDF Raw Extraction")
+        or find_sheet_name(xl, "Extraction control")
         or find_sheet_name(xl, "Extraction Control")
+        or find_sheet_by_contains(xl, "raw")
         or find_sheet_by_contains(xl, "control")
     )
 
