@@ -202,6 +202,17 @@ def consolidate_instruction_blocks(df: pd.DataFrame) -> pd.DataFrame:
         row = dict(records[i])
         title = norm(row.get("Data Title", ""))
 
+        # Already structured Pulvérisation rows must be preserved as-is.
+        # They already contain one header + aligned Débit/Vitesse/Quantité values.
+        if (
+            PULVERISATION_HEADER_RX.search(title)
+            and re.search(r"(?i)d[ée]bit\s*→\s*\d", title)
+            and re.search(r"(?i)vitesse\s+turbine\s*→\s*\d", title)
+        ):
+            fixed_records.append(row)
+            i += 1
+            continue
+
         # Start collecting only at a true Consignes/Pulvérisation header.
         starts_pulv_block = (
             "consignes" in strip_accents_lower(title)
@@ -284,11 +295,15 @@ def is_pure_noise_line(s: str) -> bool:
     return bool(PURE_NOISE_RX.match(t))
 
 def clean_row_noise(r: Dict[str, str]) -> Dict[str, str]:
-    r["Data Title"] = remove_skip_noise_inline(r.get("Data Title", ""))
-    r["Théorique"]  = remove_skip_noise_inline(r.get("Théorique", ""))
-    r["Réel"]       = remove_skip_noise_inline(r.get("Réel", ""))
-    r["Visa"]       = remove_skip_noise_inline(r.get("Visa", ""))
-    r["N° observ."] = remove_skip_noise_inline(r.get("N° observ.", ""))
+    # Clean watermark/noise in both title and value columns.
+    # With real grid-based boundaries, watermark fragments such as "de" or
+    # "travail" can land in value columns; they must not be treated as
+    # theoretical values.
+    for col in ["Data Title", "Théorique", "Réel", "Visa", "N° observ."]:
+        val = remove_skip_noise_inline(r.get(col, ""))
+        if is_pure_noise_line(val):
+            val = ""
+        r[col] = val
     return r
 
 def should_skip_text(text: str) -> bool:
@@ -551,7 +566,94 @@ def find_header_and_columns(
     cols["_table_top"] = max(bottoms) + 3.0
     return cols
 
-def make_x_boundaries(cols: Dict[str, float], page_width: float) -> Dict[str, Tuple[float, float]]:
+def _cluster_positions(values: List[float], tolerance: float = 2.0) -> List[float]:
+    """Cluster close x/y positions detected from PDF drawing primitives."""
+    vals = sorted(float(v) for v in values)
+    clusters: List[List[float]] = []
+    for v in vals:
+        if not clusters or abs(v - clusters[-1][-1]) > tolerance:
+            clusters.append([v])
+        else:
+            clusters[-1].append(v)
+    return [sum(c) / len(c) for c in clusters]
+
+
+def detect_table_grid_x_boundaries(page: fitz.Page, min_vertical_height: float = 45.0) -> List[float]:
+    """
+    Detect the real table vertical borders from PDF drawing lines.
+
+    This is more accurate than using header text centers. In Gidy templates,
+    the title/theoretical boundary is around x=276, while the word
+    "Théorique" is centered around x=319. Using the header center as a
+    boundary incorrectly sends right-aligned theoretical numbers into
+    Data Title.
+    """
+    xs: List[float] = []
+
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return []
+
+    page_width = float(page.rect.width)
+
+    for drawing in drawings:
+        for item in drawing.get("items", []):
+            kind = item[0]
+
+            if kind == "l":
+                p1, p2 = item[1], item[2]
+                if abs(float(p1.x) - float(p2.x)) <= 1.5 and abs(float(p1.y) - float(p2.y)) >= min_vertical_height:
+                    x = (float(p1.x) + float(p2.x)) / 2.0
+                    if 10 <= x <= page_width - 10:
+                        xs.append(x)
+
+            elif kind == "re":
+                rect = item[1]
+                if float(rect.height) >= min_vertical_height:
+                    for x in (float(rect.x0), float(rect.x1)):
+                        if 10 <= x <= page_width - 10:
+                            xs.append(x)
+
+    return _cluster_positions(xs, tolerance=2.0)
+
+
+def make_x_boundaries(cols: Dict[str, float], page_width: float, page: Optional[fitz.Page] = None) -> Dict[str, Tuple[float, float]]:
+    """Return real column boundaries for title / theoretical / real / visa / observation."""
+
+    # Preferred mode: use actual table borders from PDF drawings.
+    if page is not None:
+        grid_xs = detect_table_grid_x_boundaries(page)
+
+        # Need at least: left, title/theorique, theorique/reel, reel/visa, visa/observ, right.
+        if len(grid_xs) >= 6:
+            # Keep the grid that surrounds the header centers.
+            useful = [x for x in grid_xs if 0 <= x <= page_width]
+            useful = sorted(useful)
+
+            # In the Gidy template the first 6 vertical borders are the form table.
+            # If there are more verticals, pick the 6 consecutive ones covering the header centers.
+            header_centers = sorted([cols["theorique"], cols["reel"], cols["visa"], cols.get("observ", cols["visa"])])
+            best = None
+            best_score = -1
+            for i in range(0, len(useful) - 5):
+                cand = useful[i:i + 6]
+                score = sum(1 for h in header_centers if cand[0] <= h <= cand[-1])
+                if score > best_score:
+                    best = cand
+                    best_score = score
+
+            if best and best_score >= 3:
+                x_left, x_th, x_re, x_vi, x_ob, x_right = best[:6]
+                return {
+                    "title":     (x_left, x_th),
+                    "theorique": (x_th, x_re),
+                    "reel":      (x_re, x_vi),
+                    "visa":      (x_vi, x_ob),
+                    "observ":    (x_ob, x_right),
+                }
+
+    # Fallback: old behavior based on header text centers.
     xs = sorted([cols["theorique"], cols["reel"], cols["visa"], cols["observ"]])
     x_th, x_re, x_vi, x_ob = xs
     return {
@@ -768,16 +870,61 @@ def merge_bullets_under_resources(rows: List[Dict[str, str]]) -> List[Dict[str, 
 NUM_ONLY_RX = re.compile(r"^\s*\d+(?:[.,]\d+)?\s*$")
 STARTS_WITH_UNITISH_RX = re.compile(r"(?i)^\s*(%|kg|g|mg|mbar|bar|°\s*c|°c|c|min|h|tr/min|rpm)\b")
 
+def _choice_value_like(*values: str) -> bool:
+    combined = norm(" ".join(v for v in values if norm(v)))
+    low = strip_accents_lower(combined)
+    return bool(re.search(r"\b(c\s*/\s*nc|o\s*/\s*n|n\s*/\s*a)\b", low))
+
+
+def _row_has_value_cols(row: Dict[str, str]) -> bool:
+    return any(norm(row.get(c, "")) for c in ["Théorique", "Réel", "Visa", "N° observ."])
+
+
+def _merge_row_values(target: Dict[str, str], source: Dict[str, str]) -> None:
+    """Merge only value columns from source into target, avoiding duplicates."""
+    for c in ["Théorique", "Réel", "Visa", "N° observ."]:
+        value = norm(source.get(c, ""))
+        if not value:
+            continue
+        existing = norm(target.get(c, ""))
+        if not existing:
+            target[c] = value
+        elif normalize_for_repetition(value) not in normalize_for_repetition(existing):
+            target[c] = norm(f"{existing} {value}")
+
+
+def _find_previous_open_label(out: List[Dict[str, str]], max_back: int = 5) -> Optional[int]:
+    """
+    Find a recent previous title that is likely waiting for a theoretical value.
+    Example: "... quand la T° double enveloppe est :" followed by an empty-title
+    line containing "≥ 45 °C".
+    """
+    for idx in range(len(out) - 1, max(-1, len(out) - max_back - 1), -1):
+        title = norm(out[idx].get("Data Title", ""))
+        if not title or _row_has_value_cols(out[idx]):
+            continue
+        low = strip_accents_lower(title)
+        if title.endswith(":") or title.endswith("→") or "quand" in low or "est :" in low:
+            return idx
+    return None
+
+
 def merge_orphan_value_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """
-    Merge into previous row when:
-      A) Data Title is empty but value cols exist
-      B) OR Data Title is numeric-only (ex: '99,0') and Théorique starts with a unit/percent (ex: '% 101,0%')
-         => produce '99,0 % 101,0%' in previous row Théorique.
+    Align value-only lines with the correct Data Title.
+
+    Why this is needed:
+    - Some Gidy values are visually in the theoretical column but extracted on a
+      nearby empty-title row.
+    - Old logic always merged these values into the previous row, which created
+      cases like "Si MGS 2000-2 → N° (09 80 °C)" instead of aligning "80 °C"
+      with "Contrôler T° double enveloppe".
     """
     out: List[Dict[str, str]] = []
+    i = 0
 
-    for r in rows:
+    while i < len(rows):
+        r = rows[i]
         title = norm(r.get("Data Title", ""))
         th = norm(r.get("Théorique", ""))
         re_ = norm(r.get("Réel", ""))
@@ -786,33 +933,131 @@ def merge_orphan_value_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
         has_any_value = bool(th or re_ or vi or ob)
 
-        if out:
-            prev = out[-1]
+        # (B) numeric-only title + theorique fragment like "% 101,0%" -> merge into previous row theorique
+        if out and title and NUM_ONLY_RX.match(title) and th and STARTS_WITH_UNITISH_RX.match(th) and not (re_ or vi or ob):
+            merged_th = norm(f"{title} {th}")
+            if out[-1].get("Théorique"):
+                out[-1]["Théorique"] = norm(out[-1].get("Théorique", "") + " " + merged_th)
+            else:
+                out[-1]["Théorique"] = merged_th
+            i += 1
+            continue
 
-            # (B) numeric-only title + theorique fragment like "% 101,0%" -> merge into previous row theorique
-            if title and NUM_ONLY_RX.match(title) and th and STARTS_WITH_UNITISH_RX.match(th) and not (re_ or vi or ob):
-                merged_th = norm(f"{title} {th}")
-                if prev.get("Théorique"):
-                    prev["Théorique"] = norm(prev.get("Théorique", "") + " " + merged_th)
-                else:
-                    prev["Théorique"] = merged_th
+        # (A) Empty title with values: route to best target (previous, open label, or next title).
+        if (not title) and has_any_value:
+            next_row = rows[i + 1] if i + 1 < len(rows) else None
+            next_title = norm(next_row.get("Data Title", "")) if next_row else ""
+            next_has_values = _row_has_value_cols(next_row) if next_row else False
+
+            if next_row and next_title and not next_has_values:
+                next_low = strip_accents_lower(next_title)
+
+                # Conformity boxes often appear just before the "CONFORMITE DE L'ETAPE" title.
+                if "conformite" in next_low:
+                    _merge_row_values(next_row, r)
+                    i += 1
+                    continue
+
+                # Formula / range values with real/visa fragments are usually floating
+                # above the label they document (ex: reconciliation box before
+                # "Réconcilier..."). Route them forward.
+                if (re_ or vi or ob) and not _choice_value_like(th, re_, vi, ob):
+                    compact = dict(r)
+                    compact["Théorique"] = norm(" ".join(v for v in [th, re_, vi, ob] if norm(v)))
+                    compact["Réel"] = ""
+                    compact["Visa"] = ""
+                    compact["N° observ."] = ""
+                    _merge_row_values(next_row, compact)
+                    i += 1
+                    continue
+
+                # Equipment-rate values such as 660l/h can appear just before the
+                # equipment label (MGS 2000-2). Route them forward.
+                if th and (re.search(r"(?i)\bl\s*/?\s*h\b", th) or next_low.startswith("mgs")):
+                    _merge_row_values(next_row, r)
+                    i += 1
+                    continue
+
+                # If the previous row already has a theoretical value, avoid stacking a
+                # second unrelated value onto it; assign the orphan value to the next title.
+                if out and norm(out[-1].get("Théorique", "")):
+                    _merge_row_values(next_row, r)
+                    i += 1
+                    continue
+
+            # Otherwise, attach to a recent open label ending with ':' or '→'.
+            target_idx = _find_previous_open_label(out)
+            if target_idx is not None:
+                _merge_row_values(out[target_idx], r)
+                i += 1
                 continue
 
-            # (A) empty title but has values -> merge into previous row
-            if (not title) and has_any_value:
-                if th:
-                    prev["Théorique"] = norm((prev.get("Théorique", "") + " " + th).strip())
-                if re_:
-                    prev["Réel"] = norm((prev.get("Réel", "") + " " + re_).strip())
-                if vi:
-                    prev["Visa"] = norm((prev.get("Visa", "") + " " + vi).strip())
-                if ob:
-                    prev["N° observ."] = norm((prev.get("N° observ.", "") + " " + ob).strip())
+            # Default: merge into the previous output row.
+            if out:
+                _merge_row_values(out[-1], r)
+                i += 1
                 continue
 
         out.append(r)
+        i += 1
 
     return out
+
+
+def fix_shifted_values_around_conformite(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    Fix cases where a value and the conformity box are shifted by one visual line.
+
+    Example on Gidy page 7:
+      Durée →            Réel: C / NC
+      CONFORMITE...      Théorique: 3 ± 1 min
+    should become:
+      Durée →            Théorique: 3 ± 1 min
+      CONFORMITE...      Réel: C / NC
+    """
+    fixed = [dict(r) for r in rows]
+
+    for i, r in enumerate(fixed):
+        title = norm(r.get("Data Title", ""))
+        th = norm(r.get("Théorique", ""))
+        low_title = strip_accents_lower(title)
+        low_th = strip_accents_lower(th)
+
+        # Text can straddle the title/theoretical boundary: "CONFORMITE DE" | "L'ETAPE".
+        if re.fullmatch(r"conformite\s+de", low_title) and re.fullmatch(r"l[’']?\s*etape", low_th):
+            r["Data Title"] = "CONFORMITE DE L’ETAPE"
+            r["Théorique"] = ""
+
+    for i in range(len(fixed) - 1):
+        cur = fixed[i]
+        nxt = fixed[i + 1]
+
+        cur_title = norm(cur.get("Data Title", ""))
+        nxt_title = norm(nxt.get("Data Title", ""))
+        nxt_low = strip_accents_lower(nxt_title)
+
+        if "conformite" not in nxt_low:
+            continue
+
+        cur_has_choice = _choice_value_like(cur.get("Théorique", ""), cur.get("Réel", ""), cur.get("Visa", ""), cur.get("N° observ.", ""))
+        nxt_th = norm(nxt.get("Théorique", ""))
+
+        label_waiting_value = bool(re.search(r"(?:→|->|:|=)\s*$", cur_title))
+        if label_waiting_value and cur_has_choice and (not norm(cur.get("Théorique", ""))) and is_true_theorique_value(nxt_th):
+            # Move the real theoretical value back to the previous label.
+            cur["Théorique"] = nxt_th
+            nxt["Théorique"] = ""
+
+            # Move the conformity choice to the conformity row.
+            for c in ["Réel", "Visa", "N° observ."]:
+                if norm(cur.get(c, "")):
+                    if norm(nxt.get(c, "")):
+                        nxt[c] = norm(f"{nxt.get(c, '')} {cur.get(c, '')}")
+                    else:
+                        nxt[c] = norm(cur.get(c, ""))
+                    cur[c] = ""
+
+    return fixed
 
 
 # =============================================================================
@@ -825,7 +1070,7 @@ def extract_form_table_rows(page: fitz.Page, words: List[dict]) -> Optional[List
     if not cols:
         return None
 
-    bounds = make_x_boundaries(cols, float(page.rect.width))
+    bounds = make_x_boundaries(cols, float(page.rect.width), page=page)
     below = [w for w in words if w["top"] >= cols["_table_top"]]
     lines = cluster_words_by_line(below, y_tol=3.0)
 
@@ -864,6 +1109,7 @@ def extract_form_table_rows(page: fitz.Page, words: List[dict]) -> Optional[List
     rows = merge_wrapped_titles(rows)
     rows = merge_bullets_under_resources(rows)
     rows = merge_orphan_value_rows(rows)
+    rows = fix_shifted_values_around_conformite(rows)
     return rows
 
 def extract_non_table_paragraphs(
@@ -1072,7 +1318,7 @@ EMPTY_LIKE_VALUES = {"", "nan", "none", "null", "<na>", "na", "n/a"}
 PLACEHOLDER_LINE_RX = re.compile(r"^\s*[_\-–—]{6,}(?:\s+de)?\s*$", re.IGNORECASE)
 PAREN_FRAGMENT_RX = re.compile(r"^\s*\([^)]{1,30}\)\s*$")
 DANGLING_TITLE_RX = re.compile(r"(?i)(?:\b(de|du|des|d'|la|le|les|en|à|a|au|aux|pour|avec|sans|par|sur|et|ou)\b|[-/:=])\s*$")
-LOWER_CONTINUATION_RX = re.compile(r"^\s*(de|du|des|d'|en|et|ou|compression|calibrage|arrêts?|bien|stoppé)\b", re.IGNORECASE)
+LOWER_CONTINUATION_RX = re.compile(r"^\s*(de|du|des|d'|en|et|ou|bb|compression|calibrage|arrêts?|bien|stoppé)\b", re.IGNORECASE)
 
 
 def is_empty_like(value) -> bool:
@@ -1097,14 +1343,227 @@ def title_already_contains_value(title: str, value: str) -> bool:
 
 
 def append_value_to_title(title: str, value: str) -> str:
+    """Append the theoretical value directly after its label in Data Title."""
     title = norm(title)
     value = norm(value)
     if not value:
         return title
     if title_already_contains_value(title, value):
         return title
-    return norm(f"{title} ({value})") if title else f"({value})"
 
+    if not title:
+        return value
+
+    # Preserve existing form syntax when a label already ends with an arrow/colon.
+    if re.search(r"(?:→|->|:|=)\s*$", title):
+        return norm(f"{title} {value}")
+
+    # Otherwise make the Data Title explicit: Label → theoretical value.
+    return norm(f"{title} → {value}")
+
+
+
+
+# =============================================================================
+# Lossless promotion: put every extracted value into Data Title before dropping columns
+# =============================================================================
+
+VALUE_COLUMN_LABELS = {
+    "Théorique": "",
+    "Réel": "Réel",
+    "Visa": "Visa",
+    "N° observ.": "N° observ.",
+}
+
+VALUE_NOISE_RX = re.compile(r"(?i)^\s*(?:sap|copie|travail|de)\s*$")
+
+
+def clean_promoted_value(value: str) -> str:
+    """Clean a value before it is embedded in Data Title."""
+    v = remove_skip_noise_inline(norm(value))
+    if not v or VALUE_NOISE_RX.match(v):
+        return ""
+    return v
+
+
+def append_labeled_value_to_title(title: str, col: str, value: str) -> str:
+    """
+    Add any extracted value to Data Title.
+
+    - Théorique values are appended directly with the business arrow syntax.
+    - Réel / Visa / N° observ. values are kept with their source label so no
+      extracted data is lost when the helper columns are removed from the final UI.
+    """
+    title = norm(title)
+    value = clean_promoted_value(value)
+    if not value:
+        return title
+
+    if title_already_contains_value(title, value):
+        return title
+
+    if col == "Théorique":
+        return append_value_to_title(title, value)
+
+    label = VALUE_COLUMN_LABELS.get(col, col)
+    segment = f"{label}: {value}" if label else value
+
+    if not title:
+        return segment
+
+    # Keep the final Data Title readable and explicitly lossless.
+    return norm(f"{title} | {segment}")
+
+
+def promote_all_values_to_data_title(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure all extracted table data is present in Data Title.
+
+    This is intentionally performed before dropping Théorique/Réel/Visa/N° observ.
+    so the compact output remains safe: no value extracted from the PDF is lost.
+    """
+    if df.empty or "Data Title" not in df.columns:
+        return df.copy()
+
+    out = df.copy()
+    for col in GIDY_VALUE_COLS:
+        if col not in out.columns:
+            out[col] = ""
+
+    titles = []
+    tags = []
+    for _, row in out.iterrows():
+        title = norm(row.get("Data Title", ""))
+        tag = norm(row.get("Data tag", "")) or "instruction"
+
+        for col in GIDY_VALUE_COLS:
+            value = clean_promoted_value(row.get(col, ""))
+            if not value:
+                continue
+            title = append_labeled_value_to_title(title, col, value)
+
+            if col == "Visa":
+                tag = "visa"
+            elif col == "Théorique" and is_true_theorique_value(value) and tag == "instruction":
+                tag = "théorique"
+
+        titles.append(title)
+        tags.append(tag)
+
+    out["Data Title"] = titles
+    out["Data tag"] = tags
+    return out
+
+
+UNIT_RX_TEXT = r"""(?:tr\s*/\s*min|g\s*/\s*min|kg|mg|g|mbar|bar|°\s*c|°c|cm|mm|min|h|%|u|c)"""
+
+STANDALONE_VALUE_TITLE_RX = re.compile(
+    rf"""(?ix)
+    ^\s*
+    (?:
+        [<>≤≥]?\s*\d+(?:[.,]\d+)?\s*{UNIT_RX_TEXT}
+        (?:\s*(?:±|\+/-|à|a|-|–)\s*[<>≤≥]?\s*\d+(?:[.,]\d+)?\s*{UNIT_RX_TEXT})?
+        |
+        [<>≤≥]?\s*\d+(?:[.,]\d+)?\s*
+        (?:\s*(?:±|\+/-|à|a|-|–)\s*[<>≤≥]?\s*\d+(?:[.,]\d+)?)?
+        |
+        [<>≤≥]?\s*date\s+du\s+jour
+        |
+        c\s*/\s*nc|o\s*/\s*n|n\s*/\s*a|on|off
+    )
+    (?:\s+
+        (?:
+            [<>≤≥]?\s*\d+(?:[.,]\d+)?\s*{UNIT_RX_TEXT}
+            |[<>≤≥]?\s*\d+(?:[.,]\d+)?
+            |c\s*/\s*nc|o\s*/\s*n|n\s*/\s*a|on|off
+        )
+    )*
+    \s*$
+    """
+)
+
+VALUE_GROUP_RX = re.compile(
+    rf"""(?ix)
+    [<>≤≥]?\s*\d+(?:[.,]\d+)?\s*{UNIT_RX_TEXT}
+    (?:\s*(?:±|\+/-|à|a|-|–)\s*[<>≤≥]?\s*\d+(?:[.,]\d+)?\s*{UNIT_RX_TEXT})?
+    |[<>≤≥]?\s*date\s+du\s+jour
+    |c\s*/\s*nc|o\s*/\s*n|n\s*/\s*a|on|off
+    """
+)
+
+
+def is_section_or_header_title(title: str) -> bool:
+    t = norm(title)
+    low = strip_accents_lower(t)
+    if is_numbered_header(t):
+        return True
+    if low.startswith(("iv", "annexes", "compte rendu")):
+        return True
+    return False
+
+
+def standalone_value_groups(title: str) -> List[str]:
+    if not STANDALONE_VALUE_TITLE_RX.match(norm(title)):
+        return []
+    values = [norm(m.group(0)) for m in VALUE_GROUP_RX.finditer(title)]
+    return [v for v in values if v]
+
+
+def align_standalone_values_in_data_title(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge title-only value rows back into the closest Data Title when possible.
+
+    Examples handled:
+      - "Vitesse turbine →" + "7 tr / min 300 g / min" + "Débit →"
+      - "Masse totale des 20 cps (Z)" + "26,18 g à 28,94 g"
+      - "Vérifier distance..." + "25cm"
+    """
+    if df.empty or "Data Title" not in df.columns:
+        return df.copy()
+
+    records = df.to_dict("records")
+    cleaned: List[Dict[str, str]] = []
+    i = 0
+
+    while i < len(records):
+        row = dict(records[i])
+        title = norm(row.get("Data Title", ""))
+        values = standalone_value_groups(title)
+
+        if values and cleaned:
+            prev = cleaned[-1]
+            prev_title = norm(prev.get("Data Title", ""))
+            same_page_prev = str(prev.get("Page number", "")) == str(row.get("Page number", ""))
+
+            next_row = dict(records[i + 1]) if i + 1 < len(records) else None
+            next_title = norm(next_row.get("Data Title", "")) if next_row else ""
+            same_page_next = bool(next_row) and str(next_row.get("Page number", "")) == str(row.get("Page number", ""))
+
+            # If values are between two arrow labels, distribute them in order.
+            if same_page_prev and same_page_next and len(values) >= 2 and ARROW_LABEL_END_RX.search(prev_title) and ARROW_LABEL_END_RX.search(next_title):
+                prev["Data Title"] = append_value_to_title(prev_title, values[0])
+                next_row["Data Title"] = append_value_to_title(next_title, " ".join(values[1:]))
+                if next_row.get("Data tag") == "instruction":
+                    next_row["Data tag"] = "théorique"
+                cleaned.append(next_row)
+                i += 2
+                continue
+
+            # Standard case: merge the value into the previous business title.
+            if same_page_prev and not is_section_or_header_title(prev_title):
+                prev["Data Title"] = append_value_to_title(prev_title, title)
+                if prev.get("Data tag") == "instruction":
+                    prev["Data tag"] = "théorique"
+                i += 1
+                continue
+
+        cleaned.append(row)
+        i += 1
+
+    out = pd.DataFrame(cleaned)
+    if "Data number" in out.columns:
+        out["Data number"] = range(1, len(out) + 1)
+    return out
 
 def row_has_value(row: Dict[str, str]) -> bool:
     return any(not is_empty_like(row.get(c, "")) for c in GIDY_VALUE_COLS)
@@ -1127,6 +1586,15 @@ def should_merge_with_previous(prev: Dict[str, str], cur: Dict[str, str]) -> boo
     cur_title = norm(cur.get("Data Title", ""))
 
     if not prev_title or not cur_title:
+        return False
+
+    # Do not merge a new bullet/section into the previous row just because the
+    # previous row ends with ':'; this was the main cause of oversized Data Titles.
+    if is_new_item_start(cur_title):
+        return False
+
+    # Avoid merging two already-valued rows together (ex: Big bag 1 and Big bag 2).
+    if row_has_value(prev) and row_has_value(cur):
         return False
 
     if PLACEHOLDER_LINE_RX.match(cur_title):
@@ -1226,6 +1694,22 @@ ORPHAN_FRAGMENT_ROW_RX = re.compile(
     """
 )
 BULLET_CHAR_RX = re.compile(r"^[\uf0b7•‣▪●・\u2022\u25AA\u25CF]\s*")
+NEW_ITEM_START_RX = re.compile(r"^\s*(?:[\uf0b7•‣▪●・\u2022\u25AA\u25CF]\s*|\uf02d\s+|-\s+)")
+
+
+def is_new_item_start(title: str) -> bool:
+    """True when the line starts a new bullet/sub-bullet/numbered section."""
+    t = norm(title)
+    if not t:
+        return False
+    if is_numbered_header(t):
+        return True
+    if NEW_ITEM_START_RX.match(t):
+        return True
+    low = strip_accents_lower(t)
+    if low.startswith("conformite de l'etape") or low.startswith("conformite de l’ etape"):
+        return True
+    return False
 
 ARROW_LABEL_END_RX = re.compile(r"(?i)(?:→|->|:|=)\s*$")
 THEORIQUE_VALUE_ROW_RX = re.compile(
@@ -1276,7 +1760,7 @@ def should_merge_final_gidy_row(prev_title: str, title: str, same_page: bool) ->
     """Final conservative row merge rules for Gidy after all basic cleanup."""
     if not same_page or not prev_title or not title:
         return False
-    if is_numbered_header(title):
+    if is_new_item_start(title):
         return False
     if is_resource_context(prev_title) and RESOURCE_CONTINUATION_RX.match(title):
         return True
@@ -1428,17 +1912,17 @@ def transform_gidy_output(df: pd.DataFrame, compact_output: bool = True) -> pd.D
 
     df = cleanup_gidy_fragment_rows(df)
 
-    if "Data Title" in df.columns and "Théorique" in df.columns:
-        df["Data Title"] = [
-            append_value_to_title(title, theo)
-            for title, theo in zip(df["Data Title"], df["Théorique"])
-        ]
+    # Lossless: move every extracted value column into Data Title first.
+    # This keeps the compact UI output safe because Théorique/Réel/Visa/N° observ.
+    # are removed after this step.
+    df = promote_all_values_to_data_title(df)
 
     drop_cols = [c for c in GIDY_DROP_COLS if c in df.columns]
     if drop_cols:
         df = df.drop(columns=drop_cols)
 
     df = final_cleanup_gidy_output(df)
+    df = align_standalone_values_in_data_title(df)
 
     if compact_output:
         for col in UI_COLUMNS:
